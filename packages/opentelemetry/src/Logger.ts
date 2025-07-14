@@ -94,18 +94,11 @@ export const layerLoggerProvider = (
     OtelLoggerProvider,
     Effect.flatMap(Resource, (resource) =>
       Effect.acquireRelease(
-        Effect.sync(() => {
-          const provider = new Otel.LoggerProvider({
-            ...(config ?? undefined),
-            resource
-          })
-          if (Array.isArray(processor)) {
-            processor.forEach((p) => provider.addLogRecordProcessor(p))
-          } else {
-            provider.addLogRecordProcessor(processor as any)
-          }
-          return provider
-        }),
+        Effect.sync(() => new Otel.LoggerProvider({
+          ...(config ?? undefined),
+          resource,
+          processors: (Array.isArray(processor) ? processor : [processor]) as Otel.LogRecordProcessor[],
+        })),
         (provider) =>
           Effect.promise(
             () => provider.forceFlush().then(() => provider.shutdown())
