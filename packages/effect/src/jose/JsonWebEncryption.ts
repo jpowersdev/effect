@@ -58,6 +58,7 @@ import {
   type KeyError,
   prepareKey,
   rawKey,
+  unsupportedByRuntime,
   UnsupportedKeyError
 } from "./JsonWebKey.ts"
 
@@ -322,8 +323,10 @@ const cbcKeys = (enc: EncEntry, cek: Crypto.Key | Uint8Array, usage: "encrypt" |
     }
     const keySize = enc.cekBits >> 1
     const crypto = yield* cryptoService
-    const encKey =
-      yield* (crypto.importKey("raw", cek.subarray(keySize >> 3), { name: "AES-CBC" }, { usages: [usage] }))
+    const encKey = yield* mapPlatformError(
+      crypto.importKey("raw", cek.subarray(keySize >> 3), { name: "AES-CBC" }, { usages: [usage] }),
+      (error) => unsupportedByRuntime({ name: "AES-CBC" }, error, keySize) ?? error
+    )
     const macKey = yield* (crypto.importKey("raw", cek.subarray(0, keySize >> 3), {
       name: "HMAC",
       hash: `SHA-${keySize << 1}` as Crypto.DigestAlgorithm

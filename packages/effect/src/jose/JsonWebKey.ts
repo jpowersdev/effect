@@ -326,6 +326,30 @@ export const checkModulusLength = (alg: string, key: Crypto.Key) => {
 }
 
 /**
+ * Recognizes a platform failure caused by the runtime not supporting an
+ * algorithm or key size (for example, Chromium has no 192-bit AES), so it
+ * can be reported as {@link UnsupportedAlgorithmError} rather than as a
+ * problem with the key.
+ *
+ * @internal
+ */
+export const unsupportedByRuntime = (
+  algorithm: Crypto.KeyAlgorithm,
+  error: PlatformError.PlatformError,
+  bits?: number
+): UnsupportedAlgorithmError | undefined => {
+  const name = (error.reason as { readonly cause?: { readonly name?: unknown } }).cause?.name
+  const aes = algorithm.name.startsWith("AES")
+  if (name !== "NotSupportedError" && !(aes && name === "OperationError")) return undefined
+  const length = bits ?? ("length" in algorithm ? algorithm.length : undefined)
+  return new UnsupportedAlgorithmError({
+    message: `${
+      aes && length !== undefined ? `${length}-bit ${algorithm.name}` : algorithm.name
+    } is not supported by this runtime`
+  })
+}
+
+/**
  * Imports raw secret bytes for `expected`, or checks that an existing key is
  * bound to `expected` and permits `usage`.
  *
@@ -343,7 +367,8 @@ export const rawKey = (
       const crypto = yield* Crypto.Crypto
       k = yield* mapPlatformError(
         crypto.importKey("raw", key, expected, { extractable, usages: [usage] }),
-        () => invalidKey("Invalid key material for this algorithm")
+        (error) =>
+          unsupportedByRuntime(expected, error, key.length * 8) ?? invalidKey("Invalid key material for this algorithm")
       )
     } else {
       k = key
@@ -661,7 +686,10 @@ export const generateSecret = (
       : entry.key.name === "AES-KW"
       ? ["wrapKey", "unwrapKey"]
       : ["encrypt", "decrypt"]
-    return (yield* crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages })) as Crypto.Key
+    return (yield* mapPlatformError(
+      crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages }),
+      (error) => unsupportedByRuntime(algorithm, error) ?? error
+    )) as Crypto.Key
   })
 
 const required = (jwk: Record<string, unknown>, name: string, description: string): string => {
