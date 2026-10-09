@@ -353,7 +353,7 @@ export const makeKeyCache = (options: KeyCacheOptions): Effect.Effect<KeyCache> 
  * // Request handling passes JWKs loaded per request; the cache avoids
  * // re-importing the same key on every request.
  * const authenticate = (token: string) =>
- *   Effect.flatMap(loadKeyFor(token), (jwk) => JsonWebSignature.verifyCompact(token, jwk))
+ *   Effect.flatMap(loadKeyFor(token), (jwk) => JsonWebSignature.verifyCompact(token, jwk, { algorithms: ["ES256"] }))
  *
  * // Provide the cache once, where the program is assembled.
  * const AppLive = Layer.mergeAll(
