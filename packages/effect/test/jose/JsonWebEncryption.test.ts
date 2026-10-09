@@ -31,8 +31,38 @@ describe("JsonWebEncryption", () => {
     Effect.gen(function*() {
       const kek = { kty: "oct", k: "GawgguFyGrWKav7AX4VKUg" }
       const cek = new Uint8Array([
-        4, 211, 31, 197, 84, 157, 252, 254, 11, 100, 157, 250, 63, 170, 106, 206,
-        107, 124, 212, 45, 111, 107, 9, 219, 200, 177, 0, 240, 143, 156, 44, 207
+        4,
+        211,
+        31,
+        197,
+        84,
+        157,
+        252,
+        254,
+        11,
+        100,
+        157,
+        250,
+        63,
+        170,
+        106,
+        206,
+        107,
+        124,
+        212,
+        45,
+        111,
+        107,
+        9,
+        219,
+        200,
+        177,
+        0,
+        240,
+        143,
+        156,
+        44,
+        207
       ])
       const iv = new Uint8Array([3, 22, 60, 12, 43, 67, 104, 105, 108, 108, 105, 99, 111, 116, 104, 101])
       const jwe = yield* JsonWebEncryption.encryptCompact(plaintext, {
@@ -152,8 +182,8 @@ describe("JsonWebEncryption", () => {
         recipient.privateKey
       )
       assert.strictEqual(text(decrypted), plaintext)
-      assert.deepStrictEqual((protectedHeader?.epk as any).x, epk.x)
-      assert.isUndefined((protectedHeader?.epk as any).d)
+      assert.deepStrictEqual((protectedHeader!.epk as any).x, epk.x)
+      assert.isUndefined((protectedHeader!.epk as any).d)
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("keeps per-recipient ECDH-ES parameters out of the shared header", () =>

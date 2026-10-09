@@ -4,14 +4,6 @@ import type { JoseError } from "../JoseError.ts"
 import type { Usage } from "./algorithms.ts"
 import { attempt, b64uDecode, fail, failSync, isCryptoKey, isObject, mapCryptoError } from "./shared.ts"
 
-/**
- * Any key accepted by JOSE operations: a platform key, raw secret bytes for
- * symmetric algorithms, or a JSON Web Key.
- *
- * @internal
- */
-export type KeyInput = Crypto.Key | Uint8Array | Crypto.JwkData
-
 /** @internal */
 export interface KeyEntry {
   readonly alg: string
@@ -85,7 +77,10 @@ export const prepareKey = (
       return attempt(() => {
         const jwk = normalizeJwk(key)
         if (typeof jwk.kty !== "string") {
-          return failSync("InvalidKey", `Key for the ${entry.alg} algorithm must be a Key or JSON Web Key.${describe(key)}`)
+          return failSync(
+            "InvalidKey",
+            `Key for the ${entry.alg} algorithm must be a Key or JSON Web Key.${describe(key)}`
+          )
         }
         const valid = entry.secret
           ? jwk.kty === "oct" && typeof jwk.k === "string"
@@ -103,7 +98,9 @@ export const prepareKey = (
       }).pipe(Effect.flatMap((jwk): Effect.Effect<Crypto.Key | Uint8Array, JoseError, Crypto.Crypto> => {
         if (jwk.kty === "oct") {
           const bytes = b64uDecode(jwk.k as string)
-          return bytes === undefined ? fail("JwkInvalid", "Failed to base64url decode the \"k\" (Key Value) Parameter") : Effect.succeed(bytes)
+          return bytes === undefined
+            ? fail("JwkInvalid", "Failed to base64url decode the \"k\" (Key Value) Parameter")
+            : Effect.succeed(bytes)
         }
         return jwkToKey(entry, { ...jwk, alg: entry.alg } as unknown as Crypto.JwkData)
       }))
@@ -111,7 +108,9 @@ export const prepareKey = (
     if (!isCryptoKey(key)) {
       return fail(
         "InvalidKey",
-        `Key for the ${entry.alg} algorithm must be a Key${entry.secret ? ", JSON Web Key, or Uint8Array" : " or JSON Web Key"}.${describe(key)}`
+        `Key for the ${entry.alg} algorithm must be a Key${
+          entry.secret ? ", JSON Web Key, or Uint8Array" : " or JSON Web Key"
+        }.${describe(key)}`
       )
     }
     const expectedType = entry.secret ? "secret" : isPrivate ? "private" : "public"

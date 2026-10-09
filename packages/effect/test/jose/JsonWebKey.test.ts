@@ -56,12 +56,21 @@ describe("JsonWebKeySet", () => {
         ]
       }
       const resolver = yield* JsonWebKeySet.makeLocal(jwks)
-      const token = yield* JsonWebSignature.signCompact("x", { key: b.privateKey, protectedHeader: { alg: "ES256", kid: "b" } })
+      const token = yield* JsonWebSignature.signCompact("x", {
+        key: b.privateKey,
+        protectedHeader: { alg: "ES256", kid: "b" }
+      })
       yield* JsonWebSignature.verifyCompact(token, resolver)
-      const ambiguous = yield* JsonWebSignature.signCompact("x", { key: a.privateKey, protectedHeader: { alg: "ES256" } })
+      const ambiguous = yield* JsonWebSignature.signCompact("x", {
+        key: a.privateKey,
+        protectedHeader: { alg: "ES256" }
+      })
       const multiple = yield* Effect.flip(JsonWebSignature.verifyCompact(ambiguous, resolver))
       assert.strictEqual(multiple.reason, "MultipleMatchingKeys")
-      const symmetric = yield* JsonWebSignature.signCompact("x", { key: utf8("s".repeat(32)), protectedHeader: { alg: "HS256" } })
+      const symmetric = yield* JsonWebSignature.signCompact("x", {
+        key: utf8("s".repeat(32)),
+        protectedHeader: { alg: "HS256" }
+      })
       const unsupported = yield* Effect.flip(JsonWebSignature.verifyCompact(symmetric, resolver))
       assert.strictEqual(unsupported.reason, "NotSupported")
     }).pipe(Effect.provide(CryptoLive)))

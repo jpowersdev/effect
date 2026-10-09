@@ -317,12 +317,20 @@ export interface KeyOperations {
   /**
    * Encrypts `data`.
    */
-  encrypt(algorithm: CipherAlgorithm, key: Key, data: Uint8Array): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+  encrypt(
+    algorithm: CipherAlgorithm,
+    key: Key,
+    data: Uint8Array
+  ): Effect.Effect<Uint8Array, PlatformError.PlatformError>
 
   /**
    * Decrypts `data`, failing when authentication or padding checks fail.
    */
-  decrypt(algorithm: CipherAlgorithm, key: Key, data: Uint8Array): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+  decrypt(
+    algorithm: CipherAlgorithm,
+    key: Key,
+    data: Uint8Array
+  ): Effect.Effect<Uint8Array, PlatformError.PlatformError>
 
   /**
    * Derives `length` bits from a base key.

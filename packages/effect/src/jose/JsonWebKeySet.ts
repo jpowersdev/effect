@@ -20,7 +20,7 @@ import * as Semaphore from "../Semaphore.ts"
 import { JWS } from "./internal/algorithms.ts"
 import { jwkToKey } from "./internal/key.ts"
 import { error, fail, isObject } from "./internal/shared.ts"
-import { type JoseError, isJoseError } from "./JoseError.ts"
+import { isJoseError, type JoseError } from "./JoseError.ts"
 import * as JsonWebKey from "./JsonWebKey.ts"
 import type * as JsonWebSignature from "./JsonWebSignature.ts"
 
@@ -188,9 +188,7 @@ export const makeRemote = (
           ? response.json
           : fail("JwksFetchFailed", "Expected 200 OK from the JSON Web Key Set HTTP response")
       ),
-      Effect.mapError((e) =>
-        isJoseError(e) ? e : error("JwksFetchFailed", "Failed to fetch the JSON Web Key Set", e)
-      ),
+      Effect.mapError((e) => isJoseError(e) ? e : error("JwksFetchFailed", "Failed to fetch the JSON Web Key Set", e)),
       Effect.timeoutOrElse({
         duration: timeout,
         orElse: () => fail("JwksTimeout", "request timed out")

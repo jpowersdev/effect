@@ -1,7 +1,7 @@
 import * as Crypto from "../../Crypto.ts"
 import * as Effect from "../../Effect.ts"
 import type { JoseError } from "../JoseError.ts"
-import { type EncEntry, isCekTransport, type JweEntry, jweEncryption } from "./algorithms.ts"
+import { type EncEntry, isCekTransport, jweEncryption, type JweEntry } from "./algorithms.ts"
 import { checkCryptoKey, checkModulusLength, checkUsage, jwkToKey, prepareKey, rawKey } from "./key.ts"
 import {
   attempt,
@@ -60,8 +60,11 @@ const cbcKeys = (enc: EncEntry, cek: Crypto.Key | Uint8Array, usage: "encrypt" |
   })
 
 const cbcTag = (macKey: Crypto.Key, macData: Uint8Array, keySize: number) =>
-  Effect.flatMap(cryptoService, (crypto) =>
-    Effect.map(mapCryptoError(crypto.sign({ name: "HMAC" }, macKey, macData)), (mac) => mac.slice(0, keySize >> 3)))
+  Effect.flatMap(
+    cryptoService,
+    (crypto) =>
+      Effect.map(mapCryptoError(crypto.sign({ name: "HMAC" }, macKey, macData)), (mac) => mac.slice(0, keySize >> 3))
+  )
 
 /** @internal */
 export interface Encrypted {
@@ -172,12 +175,16 @@ const pbes2Derive = (p2s: Uint8Array, alg: string, p2c: number, key: Crypto.Key 
     }
     const k = yield* rawKey(key, { name: "PBKDF2" }, "deriveBits")
     const crypto = yield* cryptoService
-    return yield* mapCryptoError(crypto.deriveBits({
-      name: "PBKDF2",
-      hash: `SHA-${alg.slice(8, 11)}` as Crypto.DigestAlgorithm,
-      salt: concat(encoder.encode(alg), Uint8Array.of(0), p2s),
-      iterations: p2c
-    }, k, Number.parseInt(alg.slice(13, 16), 10)))
+    return yield* mapCryptoError(crypto.deriveBits(
+      {
+        name: "PBKDF2",
+        hash: `SHA-${alg.slice(8, 11)}` as Crypto.DigestAlgorithm,
+        salt: concat(encoder.encode(alg), Uint8Array.of(0), p2s),
+        iterations: p2c
+      },
+      k,
+      Number.parseInt(alg.slice(13, 16), 10)
+    ))
   })
 
 const lengthAndInput = (input: Uint8Array) => concat(uint32be(input.length), input)
@@ -456,7 +463,14 @@ export const decryptKeyManagement = (
         const tag = yield* attempt(() => decodeB64u(joseHeader.tag as string, "tag", "JweInvalid"))
         if (iv.byteLength !== 12) return yield* fail("JweInvalid", "Invalid Initialization Vector length")
         if (tag.byteLength !== 16) return yield* fail("JweInvalid", "Invalid Authentication Tag length")
-        return yield* decryptContent(jweEncryption(entry.alg.slice(0, -2)), key, encryptedKey!, iv, tag, new Uint8Array())
+        return yield* decryptContent(
+          jweEncryption(entry.alg.slice(0, -2)),
+          key,
+          encryptedKey!,
+          iv,
+          tag,
+          new Uint8Array()
+        )
       }
       default:
         return yield* aeskwUnwrap(entry.alg.slice(-6), key, encryptedKey!)

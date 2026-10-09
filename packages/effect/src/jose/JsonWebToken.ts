@@ -343,7 +343,9 @@ export const validateClaims = (
       : false
     if (!present) throw claimError("unexpected \"aud\" claim value", "aud", "check_failed")
   }
-  const tolerance = options.clockTolerance === undefined ? 0 : durationSeconds("clockTolerance option", options.clockTolerance)
+  const tolerance = options.clockTolerance === undefined
+    ? 0
+    : durationSeconds("clockTolerance option", options.clockTolerance)
   const now = epoch(options.currentDate === undefined ? nowMillis : options.currentDate.getTime())
   if (!Number.isFinite(now)) failSync("InvalidArgument", "Invalid currentDate option input")
   const iat = validateNumericDate(payload, "iat", maxTokenAge !== undefined)
@@ -512,7 +514,10 @@ export const decrypt: {
     const claims = yield* attempt(() => {
       const payload = validateClaims(protectedHeader, decrypted.plaintext, options ?? {}, now)
       for (const claim of ["iss", "sub", "aud"] as const) {
-        if (protectedHeader[claim] !== undefined && JSON.stringify(protectedHeader[claim]) !== JSON.stringify(payload[claim])) {
+        if (
+          protectedHeader[claim] !== undefined &&
+          JSON.stringify(protectedHeader[claim]) !== JSON.stringify(payload[claim])
+        ) {
           throw claimError(`replicated "${claim}" claim header parameter mismatch`, claim, "check_failed")
         }
       }
@@ -536,9 +541,13 @@ export const decrypt: {
  */
 export const decodeUnverified = (token: string): Effect.Effect<Claims, JoseError> =>
   attempt(() => {
-    if (typeof token !== "string") return failSync("JwtInvalid", "JWTs must use Compact JWS serialization, JWT must be a string")
+    if (typeof token !== "string") {
+      return failSync("JwtInvalid", "JWTs must use Compact JWS serialization, JWT must be a string")
+    }
     const parts = token.split(".")
-    if (parts.length === 5) return failSync("JwtInvalid", "Only JWTs using Compact JWS serialization can be decoded")
+    if (parts.length === 5) {
+      return failSync("JwtInvalid", "Only JWTs using Compact JWS serialization can be decoded")
+    }
     if (parts.length !== 3) return failSync("JwtInvalid", "Invalid JWT")
     if (!parts[1]) return failSync("JwtInvalid", "JWTs must contain a payload")
     return parseHeader(parts[1], "JwtInvalid", "Invalid JWT Claims Set") as Claims

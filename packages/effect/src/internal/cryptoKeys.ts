@@ -124,21 +124,25 @@ export const makeKeyOperations = (subtle: Crypto.SubtleCryptoLike): Crypto.KeyOp
 
   const toBytes = (buffer: ArrayBuffer) => new Uint8Array(buffer)
 
-  const importKey = ((format, keyData, algorithm, options) =>
-    run("importKey", "Could not import key", () =>
-      subtle.importKey(
-        format,
-        format === "jwk" ? keyData : bytes(keyData as Uint8Array),
-        keyAlgorithm(algorithm),
-        options.extractable ?? false,
-        Array.from(options.usages)
-      )).pipe(Effect.map(wrap))) as Crypto.KeyOperations["importKey"]
+  const importKey =
+    ((format, keyData, algorithm, options) =>
+      run("importKey", "Could not import key", () =>
+        subtle.importKey(
+          format,
+          format === "jwk" ? keyData : bytes(keyData as Uint8Array),
+          keyAlgorithm(algorithm),
+          options.extractable ?? false,
+          Array.from(options.usages)
+        )).pipe(Effect.map(wrap))) as Crypto.KeyOperations["importKey"]
 
   const exportKey = ((format, key) =>
-    Effect.flatMap(unwrap("exportKey", key), (native) =>
-      run("exportKey", "Could not export key", () => subtle.exportKey(format, native)).pipe(
-        Effect.map((exported) => format === "jwk" ? exported : toBytes(exported))
-      ))) as Crypto.KeyOperations["exportKey"]
+    Effect.flatMap(
+      unwrap("exportKey", key),
+      (native) =>
+        run("exportKey", "Could not export key", () => subtle.exportKey(format, native)).pipe(
+          Effect.map((exported) => format === "jwk" ? exported : toBytes(exported))
+        )
+    )) as Crypto.KeyOperations["exportKey"]
 
   return {
     importKey,
@@ -154,24 +158,42 @@ export const makeKeyOperations = (subtle: Crypto.SubtleCryptoLike): Crypto.KeyOp
           : wrap(generated)
       )),
     sign: (algorithm, key, data) =>
-      Effect.flatMap(unwrap("sign", key), (native) =>
-        run("sign", "Could not sign data", () => subtle.sign(algorithm, native, bytes(data))).pipe(
-          Effect.map(toBytes)
-        )),
+      Effect.flatMap(
+        unwrap("sign", key),
+        (native) =>
+          run("sign", "Could not sign data", () => subtle.sign(algorithm, native, bytes(data))).pipe(
+            Effect.map(toBytes)
+          )
+      ),
     verify: (algorithm, key, signature, data) =>
       Effect.flatMap(
         unwrap("verify", key),
         (native) =>
-          run("verify", "Could not verify signature", () => subtle.verify(algorithm, native, bytes(signature), bytes(data)))
+          run("verify", "Could not verify signature", () =>
+            subtle.verify(algorithm, native, bytes(signature), bytes(data)))
       ),
     encrypt: (algorithm, key, data) =>
-      Effect.flatMap(unwrap("encrypt", key), (native) =>
-        run("encrypt", "Could not encrypt data", () => subtle.encrypt(cipherAlgorithm(algorithm), native, bytes(data)))
-          .pipe(Effect.map(toBytes))),
+      Effect.flatMap(
+        unwrap("encrypt", key),
+        (native) =>
+          run(
+            "encrypt",
+            "Could not encrypt data",
+            () => subtle.encrypt(cipherAlgorithm(algorithm), native, bytes(data))
+          )
+            .pipe(Effect.map(toBytes))
+      ),
     decrypt: (algorithm, key, data) =>
-      Effect.flatMap(unwrap("decrypt", key), (native) =>
-        run("decrypt", "Could not decrypt data", () => subtle.decrypt(cipherAlgorithm(algorithm), native, bytes(data)))
-          .pipe(Effect.map(toBytes))),
+      Effect.flatMap(
+        unwrap("decrypt", key),
+        (native) =>
+          run(
+            "decrypt",
+            "Could not decrypt data",
+            () => subtle.decrypt(cipherAlgorithm(algorithm), native, bytes(data))
+          )
+            .pipe(Effect.map(toBytes))
+      ),
     deriveBits: (algorithm, baseKey, length) =>
       Effect.flatMap(unwrap("deriveBits", baseKey), (native) => {
         const derive = (params: any) =>
@@ -192,24 +214,30 @@ export const makeKeyOperations = (subtle: Crypto.SubtleCryptoLike): Crypto.KeyOp
         }
       }),
     wrapKey: (format, key, wrappingKey, algorithm) =>
-      Effect.flatMap(unwrap("wrapKey", key), (native) =>
-        Effect.flatMap(unwrap("wrapKey", wrappingKey), (wrappingNative) =>
-          run(
-            "wrapKey",
-            "Could not wrap key",
-            () => subtle.wrapKey(format, native, wrappingNative, cipherAlgorithm(algorithm))
-          ).pipe(Effect.map(toBytes)))),
+      Effect.flatMap(
+        unwrap("wrapKey", key),
+        (native) =>
+          Effect.flatMap(unwrap("wrapKey", wrappingKey), (wrappingNative) =>
+            run(
+              "wrapKey",
+              "Could not wrap key",
+              () => subtle.wrapKey(format, native, wrappingNative, cipherAlgorithm(algorithm))
+            ).pipe(Effect.map(toBytes)))
+      ),
     unwrapKey: (format, wrappedKey, unwrappingKey, algorithm, keyAlgorithmParams, options) =>
-      Effect.flatMap(unwrap("unwrapKey", unwrappingKey), (native) =>
-        run("unwrapKey", "Could not unwrap key", () =>
-          subtle.unwrapKey(
-            format,
-            bytes(wrappedKey),
-            native,
-            cipherAlgorithm(algorithm),
-            keyAlgorithm(keyAlgorithmParams),
-            options.extractable ?? false,
-            Array.from(options.usages)
-          )).pipe(Effect.map(wrap)))
+      Effect.flatMap(
+        unwrap("unwrapKey", unwrappingKey),
+        (native) =>
+          run("unwrapKey", "Could not unwrap key", () =>
+            subtle.unwrapKey(
+              format,
+              bytes(wrappedKey),
+              native,
+              cipherAlgorithm(algorithm),
+              keyAlgorithm(keyAlgorithmParams),
+              options.extractable ?? false,
+              Array.from(options.usages)
+            )).pipe(Effect.map(wrap))
+      )
   }
 }

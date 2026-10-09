@@ -14,7 +14,17 @@ import * as Effect from "../Effect.ts"
 import * as Schema from "../Schema.ts"
 import { ENC, JWE, JWS } from "./internal/algorithms.ts"
 import { jwkToKey, type KeyEntry, normalizeJwk } from "./internal/key.ts"
-import { attempt, b64u, b64uDecode, encoder, fail, failSync, isCryptoKey, isObject, mapCryptoError } from "./internal/shared.ts"
+import {
+  attempt,
+  b64u,
+  b64uDecode,
+  encoder,
+  fail,
+  failSync,
+  isCryptoKey,
+  isObject,
+  mapCryptoError
+} from "./internal/shared.ts"
 import type { JoseError } from "./JoseError.ts"
 
 /**
@@ -248,15 +258,16 @@ export const exportJwk = (key: Key): Effect.Effect<Jwk, JoseError, Crypto.Crypto
     return jwk as Jwk
   })
 
-const exportDer = (format: "spki" | "pkcs8", label: string, type: Crypto.Key["type"]) =>
-(key: Crypto.Key): Effect.Effect<string, JoseError, Crypto.Crypto> =>
-  Effect.gen(function*() {
-    if (!isCryptoKey(key)) return yield* fail("InvalidArgument", "Key must be a Crypto.Key")
-    if (!key.extractable) return yield* fail("InvalidArgument", "Key must be extractable")
-    if (key.type !== type) return yield* fail("InvalidArgument", `key is not a ${type} key`)
-    const crypto = yield* Crypto.Crypto
-    return derToPem(yield* mapCryptoError(crypto.exportKey(format, key)), label)
-  })
+const exportDer =
+  (format: "spki" | "pkcs8", label: string, type: Crypto.Key["type"]) =>
+  (key: Crypto.Key): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+    Effect.gen(function*() {
+      if (!isCryptoKey(key)) return yield* fail("InvalidArgument", "Key must be a Crypto.Key")
+      if (!key.extractable) return yield* fail("InvalidArgument", "Key must be extractable")
+      if (key.type !== type) return yield* fail("InvalidArgument", `key is not a ${type} key`)
+      const crypto = yield* Crypto.Crypto
+      return derToPem(yield* mapCryptoError(crypto.exportKey(format, key)), label)
+    })
 
 /**
  * Exports an extractable public key as a PEM-encoded SPKI string.
@@ -324,7 +335,10 @@ export const generateKeyPair = (
       const modulusLength = options?.modulusLength ?? 2048
       if (entry.key !== undefined && "hash" in entry.key && entry.key.name !== "HMAC") {
         if (!Number.isSafeInteger(modulusLength) || modulusLength < 2048) {
-          failSync("NotSupported", "Invalid or unsupported modulusLength option provided, 2048 bits or larger keys must be used")
+          failSync(
+            "NotSupported",
+            "Invalid or unsupported modulusLength option provided, 2048 bits or larger keys must be used"
+          )
         }
       }
       const algorithm: Crypto.KeyAlgorithm = entry.key === undefined

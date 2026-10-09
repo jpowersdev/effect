@@ -15,9 +15,9 @@
  * @stability unstable
  * @since 4.0.0
  */
-import * as Crypto from "../Crypto.ts"
+import type * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
-import { isCekTransport, JWE, type JweEntry, jweAlgorithm, jweEncryption } from "./internal/algorithms.ts"
+import { isCekTransport, JWE, jweAlgorithm, jweEncryption, type JweEntry } from "./internal/algorithms.ts"
 import * as internal from "./internal/jwe.ts"
 import { prepareKey } from "./internal/key.ts"
 import {
@@ -83,7 +83,9 @@ export interface Flattened {
 export interface General {
   readonly protected?: string | undefined
   readonly unprotected?: Header | undefined
-  readonly recipients: ReadonlyArray<{ readonly header?: Header | undefined; readonly encrypted_key?: string | undefined }>
+  readonly recipients: ReadonlyArray<
+    { readonly header?: Header | undefined; readonly encrypted_key?: string | undefined }
+  >
   readonly iv?: string | undefined
   readonly ciphertext: string
   readonly tag?: string | undefined
@@ -126,7 +128,14 @@ export type KeyResolver<E = never, R = never> = (
  * @category models
  * @since 4.0.0
  */
-export type KeyManagementParameters = internal.KeyManagementParameters
+export interface KeyManagementParameters {
+  readonly apu?: Uint8Array | undefined
+  readonly apv?: Uint8Array | undefined
+  readonly epk?: Crypto.Key | Crypto.JwkData | undefined
+  readonly p2c?: number | undefined
+  readonly p2s?: Uint8Array | undefined
+  readonly iv?: Uint8Array | undefined
+}
 
 /**
  * Options for producing a JWE.
@@ -228,7 +237,9 @@ const checkEncryptHeaders = (options: Omit<EncryptOptions, "key">): Checked => {
   validateCrit("JweInvalid", JWE_RECOGNIZED, options.crit, protectedHeader, joseHeader)
   rejectZip(joseHeader)
   const { alg, enc } = joseHeader
-  if (typeof alg !== "string" || !alg) failSync("JweInvalid", "JWE \"alg\" (Algorithm) Header Parameter missing or invalid")
+  if (typeof alg !== "string" || !alg) {
+    failSync("JweInvalid", "JWE \"alg\" (Algorithm) Header Parameter missing or invalid")
+  }
   if (typeof enc !== "string" || !enc) {
     failSync("JweInvalid", "JWE \"enc\" (Encryption Algorithm) Header Parameter missing or invalid")
   }
@@ -261,8 +272,11 @@ const encryptJwe = (
     if (parameters) {
       // With several recipients, per-recipient key management parameters
       // belong in that recipient's unprotected header.
-      if (unprotectedParameters) unprotectedHeader = unprotectedHeader ? { ...unprotectedHeader, ...parameters } : parameters
-      else protectedHeader = protectedHeader ? { ...protectedHeader, ...parameters } : parameters
+      if (unprotectedParameters) {
+        unprotectedHeader = unprotectedHeader
+          ? { ...unprotectedHeader, ...parameters }
+          : parameters
+      } else protectedHeader = protectedHeader ? { ...protectedHeader, ...parameters } : parameters
       yield* attempt(() => checkDisjoint(protectedHeader, unprotectedHeader, checked.sharedUnprotectedHeader))
     }
     const protectedString = protectedHeader ? b64u(JSON.stringify(protectedHeader)) : ""
@@ -298,7 +312,10 @@ export const encryptFlattened = (
   plaintext: Uint8Array | string,
   options: EncryptOptions
 ): Effect.Effect<Flattened, JoseError, Crypto.Crypto> =>
-  Effect.flatMap(attempt(() => checkEncryptHeaders(options)), (checked) => encryptJwe(toBytes(plaintext), checked, options))
+  Effect.flatMap(
+    attempt(() => checkEncryptHeaders(options)),
+    (checked) => encryptJwe(toBytes(plaintext), checked, options)
+  )
 
 /**
  * Produces a JWE in compact serialization.
@@ -388,7 +405,10 @@ export const encryptGeneral = (
         }
         if (enc === undefined) enc = checked.enc.alg
         else if (enc !== checked.enc.alg) {
-          failSync("JweInvalid", "JWE \"enc\" (Encryption Algorithm) Header Parameter must be the same for all recipients")
+          failSync(
+            "JweInvalid",
+            "JWE \"enc\" (Encryption Algorithm) Header Parameter must be the same for all recipients"
+          )
         }
         return checked
       })
@@ -422,7 +442,9 @@ export const encryptGeneral = (
       const target: { header?: Header; encrypted_key?: string } = { encrypted_key: b64u(encryptedKey!) }
       if (checked.unprotectedHeader || parameters) {
         const merged = { ...checked.unprotectedHeader, ...parameters }
-        if (parameters) yield* attempt(() => checkDisjoint(checked.protectedHeader, merged, checked.sharedUnprotectedHeader))
+        if (parameters) {
+          yield* attempt(() => checkDisjoint(checked.protectedHeader, merged, checked.sharedUnprotectedHeader))
+        }
         target.header = merged
       }
       out.push(target)
@@ -432,9 +454,13 @@ export const encryptGeneral = (
 
 const snapshotShared = (jwe: Record<string, unknown>) => {
   const { aad, ciphertext, iv, protected: encodedProtected, tag, unprotected } = jwe
-  if (iv !== undefined && (typeof iv !== "string" || !iv)) failSync("JweInvalid", "JWE Initialization Vector incorrect type")
+  if (iv !== undefined && (typeof iv !== "string" || !iv)) {
+    failSync("JweInvalid", "JWE Initialization Vector incorrect type")
+  }
   if (typeof ciphertext !== "string") failSync("JweInvalid", "JWE Ciphertext missing or incorrect type")
-  if (tag !== undefined && (typeof tag !== "string" || !tag)) failSync("JweInvalid", "JWE Authentication Tag incorrect type")
+  if (tag !== undefined && (typeof tag !== "string" || !tag)) {
+    failSync("JweInvalid", "JWE Authentication Tag incorrect type")
+  }
   if (encodedProtected !== undefined && typeof encodedProtected !== "string") {
     failSync("JweInvalid", "JWE Protected Header incorrect type")
   }
@@ -449,7 +475,9 @@ const checkRecipient = (jwe: Record<string, unknown>) => {
   if (encryptedKey !== undefined && typeof encryptedKey !== "string") {
     failSync("JweInvalid", "JWE Encrypted Key incorrect type")
   }
-  if (header !== undefined && !isObject(header)) failSync("JweInvalid", "JWE Per-Recipient Unprotected Header incorrect type")
+  if (header !== undefined && !isObject(header)) {
+    failSync("JweInvalid", "JWE Per-Recipient Unprotected Header incorrect type")
+  }
   if (jwe.protected === undefined && header === undefined && jwe.unprotected === undefined) {
     failSync("JweInvalid", "JOSE Header missing")
   }
@@ -495,7 +523,9 @@ const decryptJwe = <E, R>(
       if (jwe.encrypted_key === "" && (!selected || !isCekTransport(selected))) {
         failSync("JweInvalid", "JWE Encrypted Key incorrect type")
       }
-      if (typeof enc !== "string" || !enc) failSync("JweInvalid", "missing JWE Encryption Algorithm (enc) in JWE Header")
+      if (typeof enc !== "string" || !enc) {
+        failSync("JweInvalid", "missing JWE Encryption Algorithm (enc) in JWE Header")
+      }
       if (
         (keyManagementAlgorithms && !keyManagementAlgorithms.has(alg as string)) ||
         (!keyManagementAlgorithms && (alg as string).startsWith("PBES2"))
@@ -540,7 +570,8 @@ const decryptJwe = <E, R>(
           : Effect.succeed(cek)
       ),
       Effect.catchIf(
-        (e) => e.reason !== "InvalidKey" && e.reason !== "JweInvalid" && e.reason !== "NotSupported" &&
+        (e) =>
+          e.reason !== "InvalidKey" && e.reason !== "JweInvalid" && e.reason !== "NotSupported" &&
           e.reason !== "InvalidArgument",
         () => internal.generateCek(encEntry)
       )

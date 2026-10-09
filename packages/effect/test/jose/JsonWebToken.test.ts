@@ -1,8 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
+import { JsonWebKey, JsonWebToken } from "effect/jose"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
-import { JsonWebKey, JsonWebToken } from "effect/jose"
 import { CryptoLive, utf8 } from "./utils.ts"
 
 const secret = utf8("a-string-secret-at-least-256-bits-long")

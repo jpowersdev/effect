@@ -13,7 +13,7 @@
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
 import { jwsAlgorithm } from "./internal/algorithms.ts"
-import { checkModulusLength, type KeyInput, prepareKey, rawKey } from "./internal/key.ts"
+import { checkModulusLength, prepareKey, rawKey } from "./internal/key.ts"
 import {
   ascii,
   attempt,
@@ -93,7 +93,7 @@ export interface General {
  * @category models
  * @since 4.0.0
  */
-export type Key = KeyInput
+export type Key = Crypto.Key | Uint8Array | Crypto.JwkData
 
 /**
  * Selects a verification key from a token's headers.
@@ -279,8 +279,10 @@ export const signFlattened = (
   payload: Uint8Array | string,
   options: SignOptions
 ): Effect.Effect<Flattened, JoseError, Crypto.Crypto> =>
-  Effect.map(createSignature(toBytes(payload), options), ({ b64, jws, payloadBytes }) =>
-    b64 ? jws : { ...jws, payload: new TextDecoder().decode(payloadBytes) })
+  Effect.map(
+    createSignature(toBytes(payload), options),
+    ({ b64, jws, payloadBytes }) => b64 ? jws : { ...jws, payload: new TextDecoder().decode(payloadBytes) }
+  )
 
 /**
  * Produces a JWS in general JSON serialization with one signature per signer.
@@ -416,8 +418,10 @@ const verifySignature = <E, R>(
     const k = yield* rawKey(yield* prepareKey(entry, resolved, "verify"), entry.key!, "verify")
     if (entry.minRsaBits) yield* attempt(() => checkModulusLength(entry.alg, k))
     const crypto = yield* cryptoService
-    const verified = yield* Effect.orElseSucceed(crypto.verify(entry.signing, k, prepared.signature, prepared.data), () =>
-      false)
+    const verified = yield* Effect.orElseSucceed(
+      crypto.verify(entry.signing, k, prepared.signature, prepared.data),
+      () => false
+    )
     if (!verified) return yield* fail("SignatureVerificationFailed", "signature verification failed")
     const payload = typeof checked.signingPayload === "string"
       ? yield* attempt(() => decodeB64u(checked.signingPayload as string, "payload", "JwsInvalid"))

@@ -7,9 +7,6 @@ import { JoseError, type JoseErrorReason } from "../JoseError.ts"
 export const encoder = new TextEncoder()
 
 /** @internal */
-export const decoder = new TextDecoder()
-
-/** @internal */
 export const strictDecoder = new TextDecoder("utf-8", { fatal: true })
 
 /** @internal */

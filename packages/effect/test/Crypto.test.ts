@@ -161,4 +161,71 @@ describe("Crypto", () => {
       const bytes = yield* crypto.randomBytes(1)
       assert.deepStrictEqual(bytes, Uint8Array.of(0))
     }).pipe(Effect.provideService(Crypto.Crypto, testCrypto)))
+
+  describe("key operations", () => {
+    const webCrypto = Crypto.make({
+      randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
+      digest: (_algorithm, data) => Effect.succeed(data),
+      keys: Crypto.makeKeyOperations(globalThis.crypto.subtle)
+    })
+
+    it.effect("fail with PlatformError when the implementation has no key operations", () =>
+      Effect.gen(function*() {
+        const error = yield* Effect.flip(
+          testCrypto.importKey("raw", new Uint8Array(32), { name: "HMAC", hash: "SHA-256" }, { usages: ["sign"] })
+        )
+        assert.strictEqual(error._tag, "PlatformError")
+        assert.include(error.message, "importKey is not supported")
+      }))
+
+    it.effect("sign and verify with imported keys", () =>
+      Effect.gen(function*() {
+        const key = yield* webCrypto.importKey("raw", new Uint8Array(32).fill(7), { name: "HMAC", hash: "SHA-256" }, {
+          usages: ["sign", "verify"]
+        })
+        assert.deepStrictEqual(key.algorithm, { name: "HMAC", hash: "SHA-256", length: 256 })
+        assert.strictEqual(key.type, "secret")
+        assert.isFalse(key.extractable)
+        const data = new Uint8Array([1, 2, 3])
+        const mac = yield* webCrypto.sign({ name: "HMAC" }, key, data)
+        assert.isTrue(yield* webCrypto.verify({ name: "HMAC" }, key, mac, data))
+        assert.isFalse(yield* webCrypto.verify({ name: "HMAC" }, key, mac, new Uint8Array([1, 2, 4])))
+      }))
+
+    it.effect("generate, export, encrypt, and decrypt", () =>
+      Effect.gen(function*() {
+        const key = (yield* webCrypto.generateKey({ name: "AES-GCM", length: 256 }, {
+          extractable: true,
+          usages: ["encrypt", "decrypt"]
+        })) as Crypto.Key
+        assert.strictEqual((yield* webCrypto.exportKey("raw", key)).length, 32)
+        const iv = new Uint8Array(12)
+        const ciphertext = yield* webCrypto.encrypt({ name: "AES-GCM", iv }, key, new Uint8Array([9, 9]))
+        assert.deepStrictEqual(yield* webCrypto.decrypt({ name: "AES-GCM", iv }, key, ciphertext), new Uint8Array([9, 9]))
+        const tampered = ciphertext.slice()
+        tampered[0] ^= 1
+        const error = yield* Effect.flip(webCrypto.decrypt({ name: "AES-GCM", iv }, key, tampered))
+        assert.strictEqual(error._tag, "PlatformError")
+      }))
+
+    it.effect("derive bits with ECDH key pairs", () =>
+      Effect.gen(function*() {
+        const algorithm = { name: "ECDH", namedCurve: "P-256" } as const
+        const a = (yield* webCrypto.generateKey(algorithm, { usages: ["deriveBits"] })) as Crypto.KeyPair
+        const b = (yield* webCrypto.generateKey(algorithm, { usages: ["deriveBits"] })) as Crypto.KeyPair
+        const ab = yield* webCrypto.deriveBits({ name: "ECDH", public: b.publicKey }, a.privateKey, 256)
+        const ba = yield* webCrypto.deriveBits({ name: "ECDH", public: a.publicKey }, b.privateKey, 256)
+        assert.deepStrictEqual(ab, ba)
+      }))
+
+    it.effect("reject keys created by another implementation", () =>
+      Effect.gen(function*() {
+        const other = Crypto.makeKeyOperations(globalThis.crypto.subtle)
+        const key = yield* other.importKey("raw", new Uint8Array(32), { name: "HMAC", hash: "SHA-256" }, {
+          usages: ["sign"]
+        })
+        const error = yield* Effect.flip(webCrypto.sign({ name: "HMAC" }, key, new Uint8Array()))
+        assert.strictEqual(error.reason._tag, "BadArgument")
+      }))
+  })
 })
