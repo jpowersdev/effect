@@ -9,8 +9,15 @@
  * @stability unstable
  * @since 4.0.0
  */
+import * as Cache from "../Cache.ts"
+import * as Context from "../Context.ts"
 import * as Crypto from "../Crypto.ts"
+import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
+import * as Equal from "../Equal.ts"
+import * as Exit from "../Exit.ts"
+import * as Hash from "../Hash.ts"
+import * as Layer from "../Layer.ts"
 import type * as PlatformError from "../PlatformError.ts"
 import * as Schema from "../Schema.ts"
 import { ENC, JWE, JWS, type Usage } from "./internal/algorithms.ts"
@@ -203,6 +210,151 @@ const describe = (u: unknown): string =>
     : ` Received type ${typeof u}`
 
 /**
+ * Caches keys imported from JSON Web Keys.
+ *
+ * **Details**
+ *
+ * `get` returns the key for a JWK, algorithm, and operation, running `load`
+ * to import it when it is not cached. Operations that accept a JWK consult
+ * the cache provided as {@link KeyCache}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyCache {
+  readonly get: <E, R>(
+    jwk: Crypto.JwkData,
+    alg: string,
+    usage: string,
+    load: Effect.Effect<Crypto.Key, E, R>
+  ) => Effect.Effect<Crypto.Key, E, R>
+}
+
+/**
+ * The key cache used when importing JSON Web Keys.
+ *
+ * **Details**
+ *
+ * By default nothing is cached: a JWK passed to a sign, verify, encrypt, or
+ * decrypt operation is imported on every call. Provide {@link layerKeyCache}
+ * to cache imported keys. Reading this reference never adds a requirement.
+ *
+ * **Gotchas**
+ *
+ * Key sets cache their own imported keys, so the cache matters most when JWKs
+ * are passed directly, for example when they are loaded from a database per
+ * request.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const KeyCache: Context.Reference<KeyCache> = Context.Reference<KeyCache>("effect/jose/JsonWebKey/KeyCache", {
+  defaultValue: () => ({ get: (_jwk, _alg, _usage, load) => load })
+})
+
+class CacheKey<E, R> implements Equal.Equal {
+  readonly id: string
+  readonly load: Effect.Effect<Crypto.Key, E, R>
+  constructor(id: string, load: Effect.Effect<Crypto.Key, E, R>) {
+    this.id = id
+    this.load = load
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof CacheKey && that.id === this.id
+  }
+  [Hash.symbol](): number {
+    return Hash.string(this.id)
+  }
+}
+
+const canonicalJson = (value: unknown): string =>
+  Array.isArray(value)
+    ? `[${value.map(canonicalJson).join(",")}]`
+    : value !== null && typeof value === "object"
+    ? `{${
+      Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as any)[key])}`).join(",")
+    }}`
+    : JSON.stringify(value) ?? "null"
+
+/**
+ * Options for {@link makeKeyCache} and {@link layerKeyCache}.
+ *
+ * **Details**
+ *
+ * `capacity` bounds the number of cached keys; the least recently used are
+ * evicted first. `timeToLive` bounds how long a key stays cached (unbounded
+ * by default). Failed imports are not cached.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyCacheOptions {
+  readonly capacity: number
+  readonly timeToLive?: Duration.Input | undefined
+}
+
+/**
+ * Creates a bounded {@link KeyCache} built on `Cache`.
+ *
+ * **Details**
+ *
+ * Entries are keyed by the JWK's members, the algorithm, and the operation,
+ * so JWKs parsed afresh from JSON on each request still hit the cache, and a
+ * key imported for one operation is never reused for another.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const makeKeyCache = (options: KeyCacheOptions): Effect.Effect<KeyCache> =>
+  Effect.map(
+    Cache.makeWith(
+      (key: CacheKey<any, any>) => key.load,
+      {
+        capacity: options.capacity,
+        timeToLive: (exit) => Exit.isFailure(exit) ? Duration.zero : (options.timeToLive ?? Duration.infinity),
+        requireServicesAt: "lookup"
+      }
+    ),
+    (cache): KeyCache => ({
+      get: (jwk, alg, usage, load) =>
+        Cache.get(cache, new CacheKey(`${alg}|${usage}|${canonicalJson(jwk)}`, load)) as Effect.Effect<
+          Crypto.Key,
+          any,
+          any
+        >
+    })
+  )
+
+/**
+ * Provides a bounded {@link KeyCache} so JWKs passed to JOSE operations are
+ * imported once and reused.
+ *
+ * **Example** (Caching imported keys)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebKey, JsonWebSignature } from "effect/jose"
+ *
+ * declare const token: string
+ * declare const jwk: JsonWebKey.Jwk
+ *
+ * const program = JsonWebSignature.verifyCompact(token, jwk).pipe(
+ *   Effect.provide(JsonWebKey.layerKeyCache({ capacity: 1000, timeToLive: "1 hour" }))
+ * )
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layerKeyCache = (options: KeyCacheOptions): Layer.Layer<never> =>
+  Layer.effect(KeyCache, makeKeyCache(options))
+
+/**
  * Converts any supported key input into a platform key or raw secret bytes
  * suitable for `entry`, enforcing key type, `use`, `alg`, and `key_ops`.
  *
@@ -241,7 +393,11 @@ export const prepareKey = (
             ? Effect.fail(malformedKey("Failed to base64url decode the \"k\" (Key Value) Parameter"))
             : Effect.succeed(bytes)
         }
-        return jwkToKey(entry, { ...jwk, alg: entry.alg } as unknown as Crypto.JwkData)
+        const data = { ...jwk, alg: entry.alg } as unknown as Crypto.JwkData
+        return Effect.flatMap(
+          Effect.service(KeyCache),
+          (cache) => cache.get(data, entry.alg, usage, jwkToKey(entry, data))
+        )
       }))
     }
     if (!isCryptoKey(key)) {

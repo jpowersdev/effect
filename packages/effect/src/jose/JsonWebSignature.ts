@@ -153,6 +153,12 @@ export interface General {
  * A key accepted by JWS operations: a `Crypto.Key`, raw secret bytes for HMAC
  * algorithms, or a JSON Web Key.
  *
+ * **Gotchas**
+ *
+ * A JSON Web Key is imported on every call. To avoid repeated imports,
+ * import it once with `JsonWebKey.importJwk` and pass the resulting key, or
+ * provide `JsonWebKey.layerKeyCache`.
+ *
  * @stability unstable
  * @category models
  * @since 4.0.0
