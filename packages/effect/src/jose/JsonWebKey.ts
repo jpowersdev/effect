@@ -270,7 +270,7 @@ export const jwkToKey = (
 ): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
     if (!entry.kty.includes(jwk.kty)) {
-      return yield* Effect.fail(unsupportedKey(`JWK key type "${jwk.kty}" cannot be used with ${entry.alg}`))
+      return yield* Effect.fail(invalidKey(`JWK key type "${jwk.kty}" cannot be used with ${entry.alg}`))
     }
     const algorithm = entry.resolve !== undefined
       ? yield* attempt(() => entry.resolve!({ kty: jwk.kty, crv: jwk.crv }))
