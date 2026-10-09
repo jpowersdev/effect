@@ -238,7 +238,8 @@ export interface KeyCache {
  *
  * By default nothing is cached: a JWK passed to a sign, verify, encrypt, or
  * decrypt operation is imported on every call. Provide {@link layerKeyCache}
- * to cache imported keys. Reading this reference never adds a requirement.
+ * once in the application's root layer to cache imported keys. Reading this
+ * reference never adds a requirement.
  *
  * **Gotchas**
  *
@@ -333,17 +334,29 @@ export const makeKeyCache = (options: KeyCacheOptions): Effect.Effect<KeyCache> 
  * Provides a bounded {@link KeyCache} so JWKs passed to JOSE operations are
  * imported once and reused.
  *
- * **Example** (Caching imported keys)
+ * **When to use**
+ *
+ * Use as part of the application's root layer, next to the `Crypto` layer,
+ * so every operation in the program shares one cache.
+ *
+ * **Example** (Providing the key cache at the root of a program)
  *
  * ```ts
- * import { Effect } from "effect"
+ * import { Effect, Layer } from "effect"
  * import { JsonWebKey, JsonWebSignature } from "effect/jose"
  *
- * declare const token: string
- * declare const jwk: JsonWebKey.Jwk
+ * declare const CryptoLive: Layer.Layer<never>
+ * declare const loadKeyFor: (token: string) => Effect.Effect<JsonWebKey.Jwk>
  *
- * const program = JsonWebSignature.verifyCompact(token, jwk).pipe(
- *   Effect.provide(JsonWebKey.layerKeyCache({ capacity: 1000, timeToLive: "1 hour" }))
+ * // Request handling passes JWKs loaded per request; the cache avoids
+ * // re-importing the same key on every request.
+ * const authenticate = (token: string) =>
+ *   Effect.flatMap(loadKeyFor(token), (jwk) => JsonWebSignature.verifyCompact(token, jwk))
+ *
+ * // Provide the cache once, where the program is assembled.
+ * const AppLive = Layer.mergeAll(
+ *   CryptoLive,
+ *   JsonWebKey.layerKeyCache({ capacity: 1000, timeToLive: "1 hour" })
  * )
  * ```
  *
