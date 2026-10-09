@@ -29,6 +29,7 @@ const TypeId = "~effect/jose/JoseError" as const
  * - `DecryptionFailed`: authenticated decryption failed.
  * - `ClaimValidationFailed`, `Expired`: a JWT claim check failed.
  * - `NoMatchingKey`, `MultipleMatchingKeys`: key set selection failed.
+ * - `JwksTimeout`, `JwksFetchFailed`: fetching a remote key set failed.
  * - `InvalidKey`: the key cannot be used with the requested algorithm or
  *   operation.
  * - `InvalidArgument`: an option or argument is invalid.
@@ -52,6 +53,8 @@ export type JoseErrorReason =
   | "Expired"
   | "NoMatchingKey"
   | "MultipleMatchingKeys"
+  | "JwksTimeout"
+  | "JwksFetchFailed"
   | "InvalidKey"
   | "InvalidArgument"
   | "CryptoFailure"
@@ -116,6 +119,8 @@ const codes: Record<JoseErrorReason, string | undefined> = {
   Expired: "ERR_JWT_EXPIRED",
   NoMatchingKey: "ERR_JWKS_NO_MATCHING_KEY",
   MultipleMatchingKeys: "ERR_JWKS_MULTIPLE_MATCHING_KEYS",
+  JwksTimeout: "ERR_JWKS_TIMEOUT",
+  JwksFetchFailed: "ERR_JOSE_GENERIC",
   InvalidKey: undefined,
   InvalidArgument: undefined,
   CryptoFailure: undefined
