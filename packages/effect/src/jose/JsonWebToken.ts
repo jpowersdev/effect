@@ -95,7 +95,16 @@ export class TokenExpiredError
  * @category errors
  * @since 4.0.0
  */
-export type SignError = JsonWebSignature.SignError | MalformedJwtError
+export type SignError = JsonWebSignature.SignError | MalformedJwtError | ClaimValidationError
+
+/**
+ * Failures from issuing an encrypted JWT.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type EncryptError = JsonWebEncryption.EncryptError | ClaimValidationError
 
 /**
  * Failures from validating a JWT's claims.
@@ -237,7 +246,9 @@ export type Time = Date | number | Duration.Duration | Exclude<Duration.Input, n
  * **Details**
  *
  * Registered claim options override the same claims in the payload.
- * `issuedAt: true` sets `iat` to the current `Clock` time.
+ * `issuedAt: true` sets `iat` to the current `Clock` time. Unless
+ * `requireExpiration` is `false`, the token must have an `exp`, from
+ * `expirationTime` or the claims.
  *
  * @stability unstable
  * @category models
@@ -251,6 +262,7 @@ export interface IssueOptions {
   readonly expirationTime?: Time | undefined
   readonly notBefore?: Time | undefined
   readonly issuedAt?: boolean | Time | undefined
+  readonly requireExpiration?: boolean | undefined
 }
 
 /**
@@ -278,6 +290,8 @@ export interface SignOptions extends IssueOptions {
  *   `iat`.
  * - `maxTokenAge` requires `iat` and rejects older tokens.
  * - `currentDate` overrides the `Clock` time.
+ * - `requireExpiration` (default `true`) rejects tokens without `exp`. Set it
+ *   to `false` only for tokens that deliberately never expire.
  *
  * @stability unstable
  * @category models
@@ -292,6 +306,7 @@ export interface ClaimsOptions {
   readonly clockTolerance?: Duration.Input | undefined
   readonly maxTokenAge?: Duration.Input | undefined
   readonly currentDate?: Date | undefined
+  readonly requireExpiration?: boolean | undefined
 }
 
 /**
@@ -374,6 +389,13 @@ export const buildClaims = (claims: Claims, options: IssueOptions, now: number):
       throw new TypeError(`"${claim}" claim must be a finite number`)
     }
   }
+  if (options.requireExpiration !== false && payload.exp === undefined) {
+    throw new ClaimValidationError({
+      message: "JWT has no \"exp\" claim; set expirationTime, or requireExpiration: false for tokens that never expire",
+      claim: "exp",
+      check: "missing"
+    })
+  }
   return new TextEncoder().encode(JSON.stringify(payload))
 }
 
@@ -423,7 +445,7 @@ export const sign: {
   Effect.gen(function*() {
     const encoded = options.schema === undefined ? claims as Claims : yield* encodeWith(options.schema, claims)
     const now = yield* Clock.currentTimeMillis
-    const payload = yield* attemptWith<never>()(() => buildClaims(encoded, options, now))
+    const payload = yield* attemptWith<ClaimValidationError>()(() => buildClaims(encoded, options, now))
     const token = yield* JsonWebSignature.signCompact(
       payload,
       { key: options.key, protectedHeader: options.protectedHeader, crit: options.crit },
@@ -484,6 +506,7 @@ export const validateClaims = (
   }
   const { requiredClaims = [], issuer, subject, audience, maxTokenAge } = options
   const presence = [...requiredClaims]
+  if (options.requireExpiration !== false) presence.push("exp")
   if (maxTokenAge !== undefined) presence.push("iat")
   if (audience !== undefined) presence.push("aud")
   if (subject !== undefined) presence.push("sub")
@@ -569,24 +592,54 @@ const decodeWith = <S extends Schema.Constraint>(schema: S) => (payload: Record<
  *
  * **Gotchas**
  *
- * Without `algorithms`, any signature algorithm compatible with the key is
- * accepted. Pin `algorithms` when the key could be valid for several.
+ * `algorithms` is required unless the key is a `Crypto.Key`, which is bound to
+ * one algorithm.
+ *
+ * **Example** (Rejecting revoked tokens)
+ *
+ * Revocation and replay checks compose after verification, for example
+ * against a deny-list keyed by `jti`:
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebToken } from "effect/jose"
+ *
+ * declare const token: string
+ * declare const secret: Uint8Array
+ * declare const isRevoked: (jti: string | undefined) => Effect.Effect<boolean>
+ *
+ * const verified = JsonWebToken.verify(token, secret, { algorithms: ["HS256"] }).pipe(
+ *   Effect.tap(({ payload }) =>
+ *     Effect.flatMap(isRevoked(payload.jti), (revoked) =>
+ *       revoked ? Effect.fail(new Error("token revoked")) : Effect.void)
+ *   )
+ * )
+ * ```
  *
  * @stability unstable
  * @category verification
  * @since 4.0.0
  */
 export const verify: {
-  <S extends Schema.Constraint, E = never, R = never>(
+  <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>, S extends Schema.Constraint>(
     token: JsonWebSignature.TokenInput,
-    key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
-    options: VerifyOptions & { readonly schema: S }
-  ): Effect.Effect<Result<S["Type"]>, VerifyError | E, Crypto.Crypto | R | S["DecodingServices"]>
-  <E = never, R = never>(
+    key: K,
+    options: JsonWebSignature.OptionsFor<K, VerifyOptions> & { readonly schema: S }
+  ): Effect.Effect<
+    Result<S["Type"]>,
+    VerifyError | JsonWebSignature.ResolverError<K>,
+    Crypto.Crypto | JsonWebSignature.ResolverServices<K> | S["DecodingServices"]
+  >
+  <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>>(
     token: JsonWebSignature.TokenInput,
-    key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
-    options?: VerifyOptions
-  ): Effect.Effect<Result<Claims>, VerifyError | E, Crypto.Crypto | R>
+    key: K,
+    ...options: [K] extends [Crypto.Key] ? [options?: VerifyOptions]
+      : [options: JsonWebSignature.OptionsFor<K, VerifyOptions>]
+  ): Effect.Effect<
+    Result<Claims>,
+    VerifyError | JsonWebSignature.ResolverError<K>,
+    Crypto.Crypto | JsonWebSignature.ResolverServices<K>
+  >
 } = <E, R>(
   token: JsonWebSignature.TokenInput,
   key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
@@ -638,13 +691,13 @@ export const encrypt: {
     options: EncryptOptions & { readonly schema: S }
   ): Effect.Effect<
     Redacted.Redacted<Encrypted>,
-    JsonWebEncryption.EncryptError | ClaimValidationError,
+    EncryptError,
     Crypto.Crypto | S["EncodingServices"]
   >
   (
     claims: Claims,
     options: EncryptOptions
-  ): Effect.Effect<Redacted.Redacted<Encrypted>, JsonWebEncryption.EncryptError, Crypto.Crypto>
+  ): Effect.Effect<Redacted.Redacted<Encrypted>, EncryptError, Crypto.Crypto>
 } = (
   claims: unknown,
   options: EncryptOptions & { readonly schema?: Schema.Constraint }
@@ -652,7 +705,7 @@ export const encrypt: {
   Effect.gen(function*() {
     const encoded = options.schema === undefined ? claims as Claims : yield* encodeWith(options.schema, claims)
     const now = yield* Clock.currentTimeMillis
-    const bytes = yield* attemptWith<never>()(() => buildClaims(encoded, options, now))
+    const bytes = yield* attemptWith<ClaimValidationError>()(() => buildClaims(encoded, options, now))
     const payload = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>
     const protectedHeader: Record<string, unknown> = { ...options.protectedHeader }
     if (options.replicateIssuerAsHeader) protectedHeader.iss = payload.iss

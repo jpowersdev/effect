@@ -22,6 +22,7 @@ import {
   concat,
   decodeB64u,
   encoder,
+  isCryptoKey,
   isDisjoint,
   isObject,
   JWS_RECOGNIZED,
@@ -343,6 +344,71 @@ export interface VerifyOptions {
 }
 
 /**
+ * Verification options with the accepted algorithms stated, as required for
+ * keys that do not determine a single algorithm.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface VerifyOptionsWithAlgorithms extends VerifyOptions {
+  readonly algorithms: ReadonlyArray<JsonWebAlgorithm.SignatureAlgorithm>
+}
+
+/**
+ * The options a verify function requires for a given key: `algorithms` is
+ * optional with a `Crypto.Key` and required otherwise.
+ *
+ * **Details**
+ *
+ * A `Crypto.Key` is bound to one algorithm. With raw secrets, JSON Web Keys,
+ * and key resolvers the token's `alg` header would otherwise choose among
+ * compatible algorithms, so the accepted algorithms must be stated
+ * (RFC 8725 section 3.1).
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type OptionsFor<K, O extends VerifyOptions = VerifyOptions> = [K] extends [Crypto.Key] ? O
+  : O & { readonly algorithms: ReadonlyArray<JsonWebAlgorithm.SignatureAlgorithm> }
+
+/**
+ * The failures a key resolver adds.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type ResolverError<K> = 0 extends 1 & K ? never : K extends KeyResolver<infer E, infer _R> ? E : never
+
+/**
+ * The services a key resolver requires.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type ResolverServices<K> = 0 extends 1 & K ? never : K extends KeyResolver<infer _E, infer R> ? R : never
+
+/**
+ * Signature of the verify functions.
+ *
+ * @see {@link OptionsFor} for when `algorithms` is required
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface Verify<Input> {
+  <K extends Key | KeyResolver<any, any>>(
+    jws: Input,
+    key: K,
+    ...options: [K] extends [Crypto.Key] ? [options?: VerifyOptions] : [options: OptionsFor<K>]
+  ): Effect.Effect<VerifyResult, VerifyError | ResolverError<K>, Crypto.Crypto | ResolverServices<K>>
+}
+
+/**
  * Options for producing one JWS signature.
  *
  * @stability unstable
@@ -566,6 +632,9 @@ const verifySignature = <E, R>(
   parsedProtected?: Record<string, unknown>
 ): Effect.Effect<VerifyResult & { readonly b64: boolean }, VerifyError | E, Crypto.Crypto | R> =>
   Effect.gen(function*() {
+    if (options?.algorithms === undefined && (typeof key === "function" || !isCryptoKey(key))) {
+      return yield* Effect.die(new TypeError("\"algorithms\" is required unless the key is a Crypto.Key"))
+    }
     const checked = yield* attempt(() => {
       const algorithms = validateAlgorithms("algorithms", options?.algorithms)
       const protectedHeader = parsedProtected ??
@@ -712,7 +781,7 @@ export const verifyCompactInternal = <E, R>(
  * @category verification
  * @since 4.0.0
  */
-export const verifyCompact = <E = never, R = never>(
+export const verifyCompact: Verify<TokenInput> = <E, R>(
   jws: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
@@ -726,7 +795,7 @@ export const verifyCompact = <E = never, R = never>(
  * @category verification
  * @since 4.0.0
  */
-export const verifyFlattened = <E = never, R = never>(
+export const verifyFlattened: Verify<Flattened> = <E, R>(
   jws: Flattened,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
@@ -751,7 +820,7 @@ export const verifyFlattened = <E = never, R = never>(
  * @category verification
  * @since 4.0.0
  */
-export const verifyGeneral = <E = never, R = never>(
+export const verifyGeneral: Verify<General> = <E, R>(
   jws: General,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions

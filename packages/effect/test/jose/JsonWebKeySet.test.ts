@@ -33,10 +33,10 @@ describe("JsonWebKeySet", () => {
     Effect.gen(function*() {
       const { jwks, token } = yield* keySetWithoutKids
       const strict = yield* JsonWebKeySet.makeLocal(jwks)
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, strict))
+      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, strict, { algorithms: ["ES256"] }))
       assert.strictEqual(error._tag, "MultipleMatchingKeysError")
       const tryEach = yield* JsonWebKeySet.makeLocal(jwks, { multipleMatches: "tryEach" })
-      yield* JsonWebSignature.verifyCompact(token, tryEach)
+      yield* JsonWebSignature.verifyCompact(token, tryEach, { algorithms: ["ES256"] })
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("tryEach still rejects tokens no candidate signed", () =>
@@ -48,7 +48,7 @@ describe("JsonWebKeySet", () => {
         protectedHeader: { alg: "ES256" }
       })
       const resolver = yield* JsonWebKeySet.makeLocal(jwks, { multipleMatches: "tryEach" })
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, resolver))
+      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] }))
       assert.strictEqual(error._tag, "SignatureVerificationError")
     }).pipe(Effect.provide(CryptoLive)))
 
@@ -60,7 +60,7 @@ describe("JsonWebKeySet", () => {
       const options = { storage: "keyValueStore", multipleMatches: "tryEach" } as const
       const verifyWithFreshResolver = Effect.gen(function*() {
         const resolver = yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks", options)
-        yield* JsonWebSignature.verifyCompact(token, resolver)
+        yield* JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
       }).pipe(Effect.provide(http))
 
       yield* verifyWithFreshResolver
@@ -83,7 +83,7 @@ describe("JsonWebKeySet", () => {
     Effect.gen(function*() {
       const { token } = yield* keySetWithoutKids
       const resolver = yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks", { multipleMatches: "tryEach" })
-      yield* JsonWebSignature.verifyCompact(token, resolver)
+      yield* JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
     }).pipe(
       Effect.provide([CryptoLive, serving(() => ({ keys: [] }), () => {})]),
       Effect.flip,
@@ -103,7 +103,9 @@ describe("JsonWebSignature.embeddedKey", () => {
         key: privateKey,
         protectedHeader: { alg: "ES256", jwk }
       })
-      const { protectedHeader } = yield* JsonWebSignature.verifyCompact(token, JsonWebSignature.embeddedKey)
+      const { protectedHeader } = yield* JsonWebSignature.verifyCompact(token, JsonWebSignature.embeddedKey, {
+        algorithms: ["ES256"]
+      })
       assert.deepStrictEqual(protectedHeader?.jwk, jwk)
     }).pipe(Effect.provide(CryptoLive)))
 
@@ -119,7 +121,9 @@ describe("JsonWebSignature.embeddedKey", () => {
       ]
       for (const header of cases) {
         const jws = yield* JsonWebSignature.signFlattened("x", { key: privateKey, ...header })
-        const error = yield* Effect.flip(JsonWebSignature.verifyFlattened(jws, JsonWebSignature.embeddedKey))
+        const error = yield* Effect.flip(
+          JsonWebSignature.verifyFlattened(jws, JsonWebSignature.embeddedKey, { algorithms: ["ES256"] })
+        )
         assert.strictEqual(error._tag, "MalformedJwsError")
       }
       const secret = new Uint8Array(32)
@@ -127,7 +131,9 @@ describe("JsonWebSignature.embeddedKey", () => {
         key: secret,
         protectedHeader: { alg: "HS256", jwk: { kty: "oct", k: "AAAA" } }
       })
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(hmac, JsonWebSignature.embeddedKey))
+      const error = yield* Effect.flip(
+        JsonWebSignature.verifyCompact(hmac, JsonWebSignature.embeddedKey, { algorithms: ["HS256"] })
+      )
       assert.strictEqual(error._tag, "MalformedJwsError")
     }).pipe(Effect.provide(CryptoLive)))
 })

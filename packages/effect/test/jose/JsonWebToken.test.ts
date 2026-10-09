@@ -39,15 +39,23 @@ describe("JsonWebToken", () => {
 
   it.effect("validates registered claims", () =>
     Effect.gen(function*() {
-      const token = yield* JsonWebToken.sign({ sub: "u1" }, { key: secret, protectedHeader: { alg: "HS256" } })
-      const issuer = yield* Effect.flip(JsonWebToken.verify(token, secret, { issuer: "urn:other" }))
+      const token = yield* JsonWebToken.sign({ sub: "u1" }, {
+        key: secret,
+        expirationTime: "1 hour",
+        protectedHeader: { alg: "HS256" }
+      })
+      const issuer = yield* Effect.flip(
+        JsonWebToken.verify(token, secret, { algorithms: ["HS256"], issuer: "urn:other" })
+      )
       assert(issuer._tag === "ClaimValidationError")
       assert.strictEqual(issuer.claim, "iss")
       assert.strictEqual(issuer.check, "missing")
-      const subject = yield* Effect.flip(JsonWebToken.verify(token, secret, { subject: "u2" }))
+      const subject = yield* Effect.flip(JsonWebToken.verify(token, secret, { algorithms: ["HS256"], subject: "u2" }))
       assert(subject._tag === "ClaimValidationError")
       assert.strictEqual(subject.check, "check_failed")
-      const required = yield* Effect.flip(JsonWebToken.verify(token, secret, { requiredClaims: ["jti"] }))
+      const required = yield* Effect.flip(
+        JsonWebToken.verify(token, secret, { algorithms: ["HS256"], requiredClaims: ["jti"] })
+      )
       assert(required._tag === "ClaimValidationError")
       assert.strictEqual(required.claim, "jti")
     }).pipe(Effect.provide(CryptoLive)))
@@ -58,11 +66,19 @@ describe("JsonWebToken", () => {
         ...JsonWebToken.RegisteredClaims.fields,
         role: Schema.Literals(["admin", "user"])
       })
-      const token = yield* JsonWebToken.sign({ role: "user" }, { key: secret, protectedHeader: { alg: "HS256" } })
-      const { payload } = yield* JsonWebToken.verify(token, secret, { schema: Claims })
+      const token = yield* JsonWebToken.sign({ role: "user" }, {
+        key: secret,
+        expirationTime: "1 hour",
+        protectedHeader: { alg: "HS256" }
+      })
+      const { payload } = yield* JsonWebToken.verify(token, secret, { algorithms: ["HS256"], schema: Claims })
       assert.strictEqual(payload.role, "user")
-      const bad = yield* JsonWebToken.sign({ role: "root" }, { key: secret, protectedHeader: { alg: "HS256" } })
-      const error = yield* Effect.flip(JsonWebToken.verify(bad, secret, { schema: Claims }))
+      const bad = yield* JsonWebToken.sign({ role: "root" }, {
+        key: secret,
+        expirationTime: "1 hour",
+        protectedHeader: { alg: "HS256" }
+      })
+      const error = yield* Effect.flip(JsonWebToken.verify(bad, secret, { algorithms: ["HS256"], schema: Claims }))
       assert.strictEqual(error._tag, "ClaimValidationError")
     }).pipe(Effect.provide(CryptoLive)))
 
@@ -70,6 +86,7 @@ describe("JsonWebToken", () => {
     Effect.gen(function*() {
       const error = yield* Effect.flip(JsonWebToken.sign({}, {
         key: secret,
+        expirationTime: "1 hour",
         protectedHeader: { alg: "HS256", b64: false, crit: ["b64"] }
       }))
       assert.strictEqual(error._tag, "MalformedJwtError")
@@ -80,6 +97,7 @@ describe("JsonWebToken", () => {
       const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ECDH-ES+A256KW")
       const token = yield* JsonWebToken.encrypt({ role: "admin" }, {
         key: publicKey,
+        expirationTime: "1 hour",
         protectedHeader: { alg: "ECDH-ES+A256KW", enc: "A256GCM" },
         issuer: "urn:issuer",
         replicateIssuerAsHeader: true

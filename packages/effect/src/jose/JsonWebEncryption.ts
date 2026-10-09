@@ -1240,6 +1240,24 @@ const decryptJwe = <E, R>(
 /**
  * Decrypts a JWE in compact serialization.
  *
+ * **Example** (Rotating secrets)
+ *
+ * To rotate a secret without invalidating existing tokens, fall back to the
+ * previous secret:
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebEncryption } from "effect/jose"
+ *
+ * declare const token: string
+ * declare const current: Uint8Array
+ * declare const previous: Uint8Array
+ *
+ * const decrypted = JsonWebEncryption.decryptCompact(token, current).pipe(
+ *   Effect.catchTag("DecryptionError", () => JsonWebEncryption.decryptCompact(token, previous))
+ * )
+ * ```
+ *
  * @stability unstable
  * @category decryption
  * @since 4.0.0

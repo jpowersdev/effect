@@ -31,7 +31,7 @@ describe("JsonWebKey.KeyCache", () => {
       const { json, token } = yield* fixture
       const { counter, crypto } = counting()
       for (let i = 0; i < 3; i++) {
-        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json)).pipe(
+        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json), { algorithms: ["ES256"] }).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
       }
@@ -44,11 +44,13 @@ describe("JsonWebKey.KeyCache", () => {
       const { counter, crypto } = counting()
       yield* Effect.gen(function*() {
         // Fresh objects parsed from JSON each time still hit the cache.
-        for (let i = 0; i < 3; i++) yield* JsonWebSignature.verifyCompact(token, JSON.parse(json))
+        for (let i = 0; i < 3; i++) {
+          yield* JsonWebSignature.verifyCompact(token, JSON.parse(json), { algorithms: ["ES256"] })
+        }
         assert.strictEqual(counter.imports, 1)
         // Reordered members are the same key.
         const reordered = Object.fromEntries(Object.entries(JSON.parse(json)).reverse())
-        yield* JsonWebSignature.verifyCompact(token, reordered as JsonWebKey.Jwk)
+        yield* JsonWebSignature.verifyCompact(token, reordered as JsonWebKey.Jwk, { algorithms: ["ES256"] })
         assert.strictEqual(counter.imports, 1)
       }).pipe(
         Effect.provide(JsonWebKey.layerKeyCache({ capacity: 10 })),
@@ -63,15 +65,15 @@ describe("JsonWebKey.KeyCache", () => {
       const broken = { ...JSON.parse(json), x: "AAAA" }
       yield* Effect.gen(function*() {
         for (let i = 0; i < 2; i++) {
-          const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, broken))
+          const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, broken, { algorithms: ["ES256"] }))
           assert.strictEqual(error._tag, "MalformedKeyError")
         }
         assert.strictEqual(counter.imports, 2)
-        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json))
-        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json))
+        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json), { algorithms: ["ES256"] })
+        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json), { algorithms: ["ES256"] })
         assert.strictEqual(counter.imports, 3)
         yield* TestClock.adjust("2 minutes")
-        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json))
+        yield* JsonWebSignature.verifyCompact(token, JSON.parse(json), { algorithms: ["ES256"] })
         assert.strictEqual(counter.imports, 4)
       }).pipe(
         Effect.provide(JsonWebKey.layerKeyCache({ capacity: 10, timeToLive: "1 minute" })),

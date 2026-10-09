@@ -4,6 +4,7 @@ import { JsonWebEncryption, JsonWebKeySet, JsonWebSignature, JsonWebToken } from
 import { describe, expect, it } from "tstyche"
 
 declare const secret: Uint8Array
+declare const cryptoKey: Crypto.Key
 
 describe("token types", () => {
   it("produced tokens are Redacted and branded", () => {
@@ -27,10 +28,17 @@ describe("token types", () => {
     })
   })
 
+  it("algorithms are required unless the key is a Crypto.Key", () => {
+    expect(JsonWebSignature.verifyCompact).type.not.toBeCallableWith("token", secret)
+    expect(JsonWebSignature.verifyCompact).type.toBeCallableWith("token", secret, { algorithms: ["HS256"] })
+    expect(JsonWebSignature.verifyCompact).type.toBeCallableWith("token", cryptoKey)
+    expect(JsonWebToken.verify).type.not.toBeCallableWith("token", secret, { issuer: "urn:iss" })
+  })
+
   it("remote key sets fail at construction only for invalid URLs", () => {
     expect(JsonWebKeySet.makeRemote("https://issuer.example/jwks")).type.toBe<
       Effect.Effect<
-        JsonWebKeySet.Resolver<JsonWebKeySet.RemoteSelectError>,
+        JsonWebKeySet.RemoteResolver<JsonWebKeySet.RemoteSelectError>,
         JsonWebKeySet.InvalidKeySetUrlError,
         HttpClient.HttpClient
       >

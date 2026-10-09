@@ -46,7 +46,7 @@ describe("JsonWebSignature", () => {
       const jws = yield* JsonWebSignature.signCompact("hello", { key: secret, protectedHeader: { alg: "HS256" } })
       const [header, , signature] = Redacted.value(jws).split(".")
       const error = yield* Effect.flip(
-        JsonWebSignature.verifyCompact(`${header}.aGVsbG8h.${signature}`, secret)
+        JsonWebSignature.verifyCompact(`${header}.aGVsbG8h.${signature}`, secret, { algorithms: ["HS256"] })
       )
       assert.strictEqual(error._tag, "SignatureVerificationError")
     }).pipe(Effect.provide(CryptoLive)))
@@ -63,8 +63,15 @@ describe("JsonWebSignature", () => {
   it.effect("never accepts alg none", () =>
     Effect.gen(function*() {
       const token = "eyJhbGciOiJub25lIn0.aGVsbG8."
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, utf8("secret")))
-      assert.strictEqual(error._tag, "UnsupportedAlgorithmError")
+      const notAllowed = yield* Effect.flip(
+        JsonWebSignature.verifyCompact(token, utf8("secret"), { algorithms: ["HS256"] })
+      )
+      assert.strictEqual(notAllowed._tag, "AlgorithmNotAllowedError")
+      // Even if a caller forces "none" into the allow list, it is not a supported algorithm.
+      const unsupported = yield* Effect.flip(
+        JsonWebSignature.verifyCompact(token, utf8("secret"), { algorithms: ["none" as never] })
+      )
+      assert.strictEqual(unsupported._tag, "UnsupportedAlgorithmError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("rejects keys that do not match the algorithm", () =>
@@ -76,9 +83,9 @@ describe("JsonWebSignature", () => {
       assert.strictEqual(curve._tag, "InvalidKeyError")
       const rsa = yield* JsonWebKey.generateKeyPair("RS256", { extractable: true })
       const rsaJwk = yield* JsonWebKey.exportJwk(rsa.publicKey)
-      const keyType = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, rsaJwk))
+      const keyType = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, rsaJwk, { algorithms: ["ES256"] }))
       assert.strictEqual(keyType._tag, "InvalidKeyError")
-      const secret = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, utf8("secret")))
+      const secret = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, utf8("secret"), { algorithms: ["ES256"] }))
       assert.strictEqual(secret._tag, "InvalidKeyError")
       yield* JsonWebSignature.verifyCompact(jws, publicKey)
     }).pipe(Effect.provide(CryptoLive)))
@@ -89,7 +96,7 @@ describe("JsonWebSignature", () => {
       const header = { alg: "HS256", b64: false, crit: ["b64"] } as const
       const jws = yield* JsonWebSignature.signFlattened("$.02", { key: secret, protectedHeader: header })
       assert.strictEqual(jws.payload, "$.02")
-      const { payload } = yield* JsonWebSignature.verifyFlattened(jws, secret)
+      const { payload } = yield* JsonWebSignature.verifyFlattened(jws, secret, { algorithms: ["HS256"] })
       assert.strictEqual(text(payload), "$.02")
 
       const custom = yield* JsonWebSignature.signCompact("x", {
@@ -97,9 +104,9 @@ describe("JsonWebSignature", () => {
         protectedHeader: { alg: "HS256", crit: ["urn:example"], "urn:example": 1 },
         crit: { "urn:example": true }
       })
-      const unknown = yield* Effect.flip(JsonWebSignature.verifyCompact(custom, secret))
+      const unknown = yield* Effect.flip(JsonWebSignature.verifyCompact(custom, secret, { algorithms: ["HS256"] }))
       assert.strictEqual(unknown._tag, "UnsupportedJwsHeaderError")
-      yield* JsonWebSignature.verifyCompact(custom, secret, { crit: { "urn:example": true } })
+      yield* JsonWebSignature.verifyCompact(custom, secret, { algorithms: ["HS256"], crit: { "urn:example": true } })
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("signs and verifies general JSON with several signers", () =>
@@ -111,7 +118,7 @@ describe("JsonWebSignature", () => {
         { key: es.sign, protectedHeader: { alg: "ES256" } }
       ])
       assert.strictEqual(jws.signatures.length, 2)
-      yield* JsonWebSignature.verifyGeneral(jws, hs.verify)
-      yield* JsonWebSignature.verifyGeneral(jws, es.verify)
+      yield* JsonWebSignature.verifyGeneral(jws, hs.verify, { algorithms: ["HS256", "ES256"] })
+      yield* JsonWebSignature.verifyGeneral(jws, es.verify, { algorithms: ["HS256", "ES256"] })
     }).pipe(Effect.provide(CryptoLive)))
 })

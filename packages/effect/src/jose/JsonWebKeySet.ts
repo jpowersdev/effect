@@ -321,8 +321,9 @@ export type Storage = "memory" | "keyValueStore"
  *
  * **Details**
  *
- * - `cacheMaxAge`: how long a fetched set is considered fresh (10 minutes by
- *   default).
+ * - `cacheMaxAge`: the longest a fetched set is considered fresh (10 minutes by
+ *   default). A shorter `Cache-Control: max-age` on the response takes
+ *   precedence.
  * - `cooldownDuration`: minimum time between refetches triggered by an
  *   unknown key (30 seconds by default).
  * - `timeoutDuration`: request timeout (5 seconds by default).
@@ -375,7 +376,32 @@ export type StorageServices<O> = O extends { readonly storage: "keyValueStore" }
 export type StorageError<O> = O extends { readonly storage: "keyValueStore" } ? KeyValueStore.KeyValueStoreError
   : never
 
-const StoredKeySet = Schema.fromJsonString(Schema.Struct({ fetchedAt: Schema.Finite, jwks: JwkSet }))
+const StoredKeySet = Schema.fromJsonString(
+  Schema.Struct({ fetchedAt: Schema.Finite, expiresAt: Schema.Finite, jwks: JwkSet })
+)
+
+/**
+ * A resolver backed by a remote key set, with an explicit `refresh`.
+ *
+ * **Details**
+ *
+ * `refresh` fetches the key set now, bypassing the cache. Run it once at
+ * startup so the first request does not wait for the fetch, or repeat it on a
+ * schedule to refresh in the background.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface RemoteResolver<E> extends Resolver<E> {
+  readonly refresh: Effect.Effect<void, Exclude<E, SelectError> | MalformedKeySetError>
+}
+
+const cacheControlMaxAge = (header: string | undefined): number | undefined => {
+  if (header === undefined) return undefined
+  const match = /(?:^|,)\s*max-age\s*=\s*"?(\d+)"?\s*(?:,|$)/i.exec(header)
+  return match === null ? undefined : Number(match[1])
+}
 
 const validateUrl = (url: string | URL, allowInsecureHttp: boolean): Effect.Effect<URL, InvalidKeySetUrlError> => {
   let parsed: URL
@@ -428,7 +454,7 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
   url: string | URL,
   options?: O
 ): Effect.Effect<
-  Resolver<RemoteSelectError | StorageError<O>>,
+  RemoteResolver<RemoteSelectError | StorageError<O>>,
   InvalidKeySetUrlError,
   HttpClient.HttpClient | StorageServices<O>
 > =>
@@ -449,6 +475,7 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
     const lock = yield* Semaphore.make(1)
     let local: Resolver | undefined
     let fetchedAt = -Infinity
+    let expiresAt = -Infinity
 
     const tooLarge = (message: string) => new KeySetTooLargeError({ url: href, message })
 
@@ -467,7 +494,7 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
       )
 
     const fetchSet: Effect.Effect<
-      unknown,
+      { readonly json: unknown; readonly maxAge: number | undefined },
       KeySetFetchError | KeySetTimeoutError | KeySetTooLargeError
     > = client.get(href, {
       headers: { accept: "application/json", ...options?.headers }
@@ -486,18 +513,19 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
             new KeySetFetchError({ url: href, message: `Refusing a response from a different URL: ${response.url}` })
           )
         }
+        const maxAge = cacheControlMaxAge(response.headers["cache-control"])
         return Effect.flatMap(readBody(response.stream), (chunks) => {
           const body = new TextDecoder().decode(concatChunks(chunks))
           return Effect.try({
-            try: () => JSON.parse(body) as unknown,
+            try: () => ({ json: JSON.parse(body) as unknown, maxAge }),
             catch: (cause) => new KeySetFetchError({ url: href, message: "Response is not JSON", cause })
           })
         })
       }),
-      Effect.flatMap((json) =>
-        isObject(json) && Array.isArray(json.keys) && json.keys.length > maxKeys
+      Effect.flatMap((fetched) =>
+        isObject(fetched.json) && Array.isArray(fetched.json.keys) && fetched.json.keys.length > maxKeys
           ? Effect.fail(tooLarge(`JSON Web Key Set has more than ${maxKeys} keys`))
-          : Effect.succeed(json)
+          : Effect.succeed(fetched)
       ),
       Effect.mapError((e) =>
         e._tag === "KeySetFetchError" || e._tag === "KeySetTooLargeError"
@@ -517,23 +545,26 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
         const raw = yield* store.get(storageKey)
         if (raw === undefined) return false
         const stored = yield* Effect.option(Schema.decodeUnknownEffect(StoredKeySet)(raw))
-        if (stored._tag === "None" || now - stored.value.fetchedAt >= cacheMaxAge) return false
+        if (stored._tag === "None" || now >= stored.value.expiresAt) return false
         const resolver = yield* Effect.option(makeLocal(stored.value.jwks as JwkSet, localOptions))
         if (resolver._tag === "None") return false
         local = resolver.value
         fetchedAt = stored.value.fetchedAt
+        expiresAt = stored.value.expiresAt
         return true
       })
 
     const reload = (force: boolean) =>
       lock.withPermit(Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
-        if (!force && local !== undefined && now - fetchedAt < cacheMaxAge) return local
+        if (!force && local !== undefined && now < expiresAt) return local
         if (!force && local === undefined && (yield* loadStored(now))) return local!
-        const json = yield* fetchSet
+        const { json, maxAge } = yield* fetchSet
         local = yield* makeLocal(json as JwkSet, localOptions)
         fetchedAt = yield* Clock.currentTimeMillis
-        if (store !== undefined) yield* store.set(storageKey, JSON.stringify({ fetchedAt, jwks: json }))
+        // The response's Cache-Control max-age shortens freshness; cacheMaxAge caps it.
+        expiresAt = fetchedAt + (maxAge === undefined ? cacheMaxAge : Math.min(maxAge * 1000, cacheMaxAge))
+        if (store !== undefined) yield* store.set(storageKey, JSON.stringify({ fetchedAt, expiresAt, jwks: json }))
         return local
       }))
 
@@ -548,9 +579,11 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
         const fresh = yield* reload(true)
         return yield* fresh(protectedHeader, token)
       })
-    return resolver as Resolver<RemoteSelectError | StorageError<O>>
+    return Object.assign(resolver, { refresh: Effect.asVoid(reload(true)) }) as RemoteResolver<
+      RemoteSelectError | StorageError<O>
+    >
   }) as unknown as Effect.Effect<
-    Resolver<RemoteSelectError | StorageError<O>>,
+    RemoteResolver<RemoteSelectError | StorageError<O>>,
     InvalidKeySetUrlError,
     HttpClient.HttpClient | StorageServices<O>
   >
