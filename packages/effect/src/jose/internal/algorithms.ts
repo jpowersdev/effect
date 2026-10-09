@@ -1,5 +1,11 @@
 import type * as Crypto from "../../Crypto.ts"
-import { failSync } from "./shared.ts"
+import { UnsupportedAlgorithmError } from "../JsonWebAlgorithm.ts"
+import { raise } from "./shared.ts"
+
+const unsupported = (message: string, algorithm?: unknown) =>
+  raise(
+    new UnsupportedAlgorithmError(typeof algorithm === "string" ? { algorithm, message } : { message })
+  )
 
 /** @internal */
 export type Usage = "sign" | "verify" | "encrypt" | "decrypt"
@@ -78,7 +84,7 @@ export const JWS: Readonly<Record<string, JwsEntry>> = Object.assign(Object.crea
 /** @internal */
 export const jwsAlgorithm = (alg: unknown): JwsEntry =>
   (typeof alg === "string" ? JWS[alg] : undefined) ??
-    failSync("NotSupported", `alg ${String(alg)} is not supported`)
+    unsupported(`alg ${String(alg)} is not supported`, alg)
 
 /** @internal */
 export type JweMode =
@@ -125,7 +131,7 @@ const ecdh = (alg: string, mode: JweMode): JweEntry => ({
   resolve: ({ kty, crv }) => {
     if (crv === "X25519") return { name: "X25519" }
     if (kty === "OKP" || (crv !== "P-256" && crv !== "P-384" && crv !== "P-521")) {
-      return failSync("NotSupported", "Invalid or unsupported JWK \"alg\" (Algorithm) Parameter value")
+      return unsupported(`ECDH with curve ${String(crv)} is not supported`)
     }
     return { name: "ECDH", namedCurve: crv }
   },
@@ -221,12 +227,12 @@ export const ENC: Readonly<Record<string, EncEntry>> = Object.assign(Object.crea
 /** @internal */
 export const jweAlgorithm = (alg: unknown): JweEntry =>
   (typeof alg === "string" ? JWE[alg] : undefined) ??
-    failSync("NotSupported", "Invalid or unsupported \"alg\" (JWE Algorithm) header value")
+    unsupported("Invalid or unsupported \"alg\" (JWE Algorithm) header value", alg)
 
 /** @internal */
 export const jweEncryption = (enc: unknown): EncEntry =>
   (typeof enc === "string" ? ENC[enc] : undefined) ??
-    failSync("NotSupported", "Invalid or unsupported \"enc\" (JWE Encryption Algorithm) header value")
+    unsupported("Invalid or unsupported \"enc\" (JWE Encryption Algorithm) header value", enc)
 
 /** @internal */
 export const isCekTransport = (entry: JweEntry): boolean =>

@@ -11,21 +11,85 @@
  */
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import type * as PlatformError from "../PlatformError.ts"
 import * as Schema from "../Schema.ts"
-import { ENC, JWE, JWS } from "./internal/algorithms.ts"
-import { jwkToKey, type KeyEntry, normalizeJwk } from "./internal/key.ts"
+import { ENC, JWE, JWS, type Usage } from "./internal/algorithms.ts"
 import {
-  attempt,
+  attemptWith,
   b64u,
   b64uDecode,
   encoder,
-  fail,
-  failSync,
   isCryptoKey,
   isObject,
-  mapCryptoError
+  mapPlatformError,
+  raise
 } from "./internal/shared.ts"
-import type { JoseError } from "./JoseError.ts"
+import { UnsupportedAlgorithmError } from "./JsonWebAlgorithm.ts"
+
+/**
+ * Error raised when a key cannot be used for the requested algorithm or
+ * operation: the wrong key type, curve, or size; a public key where a
+ * private key is needed; a non-extractable key that must be exported; or a
+ * JWK whose `alg`, `use`, or `key_ops` forbid the operation.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class InvalidKeyError extends Schema.TaggedError<InvalidKeyError>("effect/jose/JsonWebKey/InvalidKeyError")(
+  "InvalidKeyError",
+  { message: Schema.String }
+) {}
+
+/**
+ * Error raised when key data is malformed: a JWK with missing or invalid
+ * members, or PEM text that does not contain a valid key.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class MalformedKeyError
+  extends Schema.TaggedError<MalformedKeyError>("effect/jose/JsonWebKey/MalformedKeyError")(
+    "MalformedKeyError",
+    { message: Schema.String, cause: Schema.optional(Schema.Defect()) }
+  )
+{}
+
+/**
+ * Error raised when a key type, curve, or key parameter is not supported,
+ * such as an unknown `kty`, RSA multi-prime keys, or RSA keys smaller than
+ * 2048 bits.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class UnsupportedKeyError
+  extends Schema.TaggedError<UnsupportedKeyError>("effect/jose/JsonWebKey/UnsupportedKeyError")(
+    "UnsupportedKeyError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Failures from preparing a key for a JOSE operation.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type KeyError =
+  | InvalidKeyError
+  | MalformedKeyError
+  | UnsupportedKeyError
+  | UnsupportedAlgorithmError
+  | PlatformError.PlatformError
+
+const attempt = attemptWith<KeyError>()
+const invalidKey = (message: string) => new InvalidKeyError({ message })
+const malformedKey = (message: string) => new MalformedKeyError({ message })
+const unsupportedKey = (message: string) => new UnsupportedKeyError({ message })
 
 /**
  * Structural JSON Web Key data.
@@ -84,18 +148,224 @@ export const Jwk = Schema.Struct({
  */
 export type Key = Crypto.Key | Uint8Array
 
+/** @internal */
+export interface KeyEntry {
+  readonly alg: string
+  readonly kty: ReadonlyArray<string>
+  readonly secret: boolean
+  readonly key: Crypto.KeyAlgorithm | undefined
+  readonly resolve?: (jwk: { readonly kty?: unknown; readonly crv?: unknown }) => Crypto.KeyAlgorithm
+  readonly usages: readonly [ReadonlyArray<Crypto.KeyUsage>, ReadonlyArray<Crypto.KeyUsage>]
+  readonly ops?: readonly [Crypto.KeyUsage | undefined, Crypto.KeyUsage | undefined]
+}
+
+const normalizeJwk = (jwk: Record<string, unknown>): Record<string, unknown> => {
+  const normalized: Record<string, unknown> = { ...jwk }
+  if (normalized.ext !== undefined && typeof normalized.ext !== "boolean") {
+    return raise(invalidKey("\"ext\" (Extractable) Parameter must be a boolean"))
+  }
+  if (normalized.key_ops !== undefined) {
+    const value = normalized.key_ops
+    const keyOps = Array.isArray(value) ? [...value] : undefined
+    if (!keyOps || keyOps.some((op) => typeof op !== "string") || new Set(keyOps).size !== keyOps.length) {
+      return raise(invalidKey("\"key_ops\" (Key Operations) Parameter must be an array of unique strings"))
+    }
+    normalized.key_ops = keyOps
+  }
+  return normalized
+}
+
+const jwkMatchesOp = (entry: KeyEntry, jwk: Record<string, unknown>, usage: Usage) => {
+  if (jwk.use !== undefined) {
+    const expected = usage === "sign" || usage === "verify" ? "sig" : "enc"
+    if (jwk.use !== expected) {
+      raise(invalidKey(`Invalid key for this operation, its "use" must be "${expected}" when present`))
+    }
+  }
+  if (jwk.alg !== undefined && jwk.alg !== entry.alg) {
+    raise(invalidKey(`Invalid key for this operation, its "alg" must be "${entry.alg}" when present`))
+  }
+  if (Array.isArray(jwk.key_ops)) {
+    const expected = usage === "encrypt" || usage === "decrypt"
+      ? entry.ops?.[usage === "encrypt" ? 0 : 1]
+      : usage
+    if (expected && !jwk.key_ops.includes(expected)) {
+      raise(invalidKey(`Invalid key for this operation, its "key_ops" must include "${expected}" when present`))
+    }
+  }
+}
+
+const describe = (u: unknown): string =>
+  u === null || u === undefined
+    ? ` Received ${u}`
+    : typeof u === "object" && (u as any).constructor?.name
+    ? ` Received an instance of ${(u as any).constructor.name}`
+    : ` Received type ${typeof u}`
+
+/**
+ * Converts any supported key input into a platform key or raw secret bytes
+ * suitable for `entry`, enforcing key type, `use`, `alg`, and `key_ops`.
+ *
+ * @internal
+ */
+export const prepareKey = (
+  entry: KeyEntry,
+  key: unknown,
+  usage: Usage
+): Effect.Effect<Crypto.Key | Uint8Array, KeyError, Crypto.Crypto> =>
+  Effect.suspend(() => {
+    const isPrivate = usage === "decrypt" || usage === "sign"
+    if (entry.secret && key instanceof Uint8Array) return Effect.succeed(key)
+    if (isObject(key)) {
+      return attempt(() => {
+        const jwk = normalizeJwk(key)
+        if (typeof jwk.kty !== "string") {
+          return raise(invalidKey(`Key for the ${entry.alg} algorithm must be a Key or JSON Web Key.${describe(key)}`))
+        }
+        const valid = entry.secret
+          ? jwk.kty === "oct" && typeof jwk.k === "string"
+          : jwk.kty !== "oct" && (isPrivate ? typeof jwk.d === "string" : jwk.d === undefined)
+        if (!valid) {
+          raise(invalidKey(
+            entry.secret
+              ? "JSON Web Key for symmetric algorithms must have JWK \"kty\" (Key Type) equal to \"oct\" and the JWK \"k\" (Key Value) present"
+              : `JSON Web Key for this operation must be a ${isPrivate ? "private" : "public"} JWK`
+          ))
+        }
+        jwkMatchesOp(entry, jwk, usage)
+        return jwk
+      }).pipe(Effect.flatMap((jwk): Effect.Effect<Crypto.Key | Uint8Array, KeyError, Crypto.Crypto> => {
+        if (jwk.kty === "oct") {
+          const bytes = b64uDecode(jwk.k as string)
+          return bytes === undefined
+            ? Effect.fail(malformedKey("Failed to base64url decode the \"k\" (Key Value) Parameter"))
+            : Effect.succeed(bytes)
+        }
+        return jwkToKey(entry, { ...jwk, alg: entry.alg } as unknown as Crypto.JwkData)
+      }))
+    }
+    if (!isCryptoKey(key)) {
+      return Effect.fail(invalidKey(
+        `Key for the ${entry.alg} algorithm must be a Key${
+          entry.secret ? ", JSON Web Key, or Uint8Array" : " or JSON Web Key"
+        }.${describe(key)}`
+      ))
+    }
+    const expectedType = entry.secret ? "secret" : isPrivate ? "private" : "public"
+    if (key.type !== expectedType) {
+      return Effect.fail(invalidKey(`Key instances must be of type "${expectedType}" for the ${entry.alg} algorithm`))
+    }
+    return Effect.succeed(key)
+  })
+
+/**
+ * Imports a JSON Web Key for `entry`, using its `key_ops` when present.
+ *
+ * @internal
+ */
+export const jwkToKey = (
+  entry: KeyEntry,
+  jwk: Crypto.JwkData,
+  extractable?: boolean
+): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
+  Effect.gen(function*() {
+    if (!entry.kty.includes(jwk.kty)) {
+      return yield* Effect.fail(unsupportedKey(`JWK key type "${jwk.kty}" cannot be used with ${entry.alg}`))
+    }
+    const algorithm = entry.resolve !== undefined
+      ? yield* attempt(() => entry.resolve!({ kty: jwk.kty, crv: jwk.crv }))
+      : entry.key
+    if (algorithm === undefined) {
+      return yield* Effect.fail(unsupportedKey(`JWK cannot be used with ${entry.alg}`))
+    }
+    const isPrivate = typeof jwk.d === "string"
+    const { alg: _alg, use: _use, ...keyData } = jwk as Record<string, unknown>
+    const ext = extractable ?? (keyData.ext as boolean | undefined)
+    if (ext !== undefined) keyData.ext = ext
+    else delete keyData.ext
+    const crypto = yield* Crypto.Crypto
+    const usages = (jwk.key_ops as ReadonlyArray<Crypto.KeyUsage> | undefined) ?? entry.usages[isPrivate ? 1 : 0]
+    return yield* mapPlatformError(
+      crypto.importKey("jwk", keyData as Crypto.JwkData, algorithm, { extractable: ext ?? !isPrivate, usages }),
+      (cause) => new MalformedKeyError({ message: "Invalid JSON Web Key", cause })
+    )
+  })
+
+const unusable = (name: string | number, prop = "algorithm.name") =>
+  raise(invalidKey(`Key does not support this operation, its ${prop} must be ${name}`))
+
+/** @internal */
+export const checkUsage = (key: Crypto.Key, usage: Crypto.KeyUsage | undefined) => {
+  if (usage && !key.usages.includes(usage)) {
+    raise(invalidKey(`Key does not support this operation, its usages must include ${usage}.`))
+  }
+}
+
+/** @internal */
+export const checkCryptoKey = (key: Crypto.Key, expected: Crypto.KeyAlgorithm, usage: Crypto.KeyUsage | undefined) => {
+  const algorithm = key.algorithm
+  if (algorithm.name !== expected.name) unusable(expected.name)
+  if ("hash" in expected && expected.hash !== undefined && algorithm.hash !== expected.hash) {
+    unusable(expected.hash, "algorithm.hash")
+  }
+  if ("namedCurve" in expected && algorithm.namedCurve !== expected.namedCurve) {
+    unusable(expected.namedCurve, "algorithm.namedCurve")
+  }
+  if ("length" in expected && expected.length !== undefined && algorithm.length !== expected.length) {
+    unusable(expected.length, "algorithm.length")
+  }
+  checkUsage(key, usage)
+}
+
+/** @internal */
+export const checkModulusLength = (alg: string, key: Crypto.Key) => {
+  const { modulusLength } = key.algorithm
+  if (typeof modulusLength !== "number" || modulusLength < 2048) {
+    raise(invalidKey(`${alg} requires key modulusLength to be 2048 bits or larger`))
+  }
+}
+
+/**
+ * Imports raw secret bytes for `expected`, or checks that an existing key is
+ * bound to `expected` and permits `usage`.
+ *
+ * @internal
+ */
+export const rawKey = (
+  key: Crypto.Key | Uint8Array,
+  expected: Crypto.KeyAlgorithm,
+  usage: Crypto.KeyUsage,
+  extractable = false
+): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
+  Effect.gen(function*() {
+    let k: Crypto.Key
+    if (key instanceof Uint8Array) {
+      const crypto = yield* Crypto.Crypto
+      k = yield* mapPlatformError(
+        crypto.importKey("raw", key, expected, { extractable, usages: [usage] }),
+        () => invalidKey("Invalid key material for this algorithm")
+      )
+    } else {
+      k = key
+    }
+    yield* attempt(() => checkCryptoKey(k, expected, usage))
+    return k
+  })
+
 const ecdhCurve = (crv: string | undefined): Crypto.KeyAlgorithm =>
   crv === "X25519"
     ? { name: "X25519" }
     : crv === undefined || crv === "P-256" || crv === "P-384" || crv === "P-521"
     ? { name: "ECDH", namedCurve: (crv ?? "P-256") as Crypto.NamedCurve }
-    : failSync("NotSupported", "Invalid or unsupported crv option provided")
+    : raise(unsupportedKey(`Unsupported curve "${crv}"`))
 
 const entryFor = (alg: unknown): KeyEntry => {
-  if (typeof alg !== "string") return failSync("InvalidArgument", "\"alg\" argument is required")
+  if (typeof alg !== "string") {
+    return raise(invalidKey("An algorithm is required when the JWK has no \"alg\" parameter"))
+  }
   const entry: KeyEntry | undefined = JWS[alg] ?? JWE[alg] ?? ENC[alg]
   if (entry === undefined || alg === "dir") {
-    return failSync("NotSupported", "Invalid or unsupported JWK \"alg\" (Algorithm) Parameter value")
+    return raise(new UnsupportedAlgorithmError({ algorithm: alg, message: `Unsupported algorithm "${alg}"` }))
   }
   return entry
 }
@@ -118,30 +388,34 @@ export const importJwk = (
   jwk: Jwk,
   alg?: string,
   options?: { readonly extractable?: boolean | undefined }
-): Effect.Effect<Key, JoseError, Crypto.Crypto> =>
+): Effect.Effect<Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
-    if (!isObject(jwk)) return yield* fail("InvalidArgument", "JWK must be an object")
+    if (!isObject(jwk)) return yield* Effect.die(new TypeError("JWK must be an object"))
     const normalized = yield* attempt(() => normalizeJwk(jwk))
     const algorithm = alg ?? normalized.alg
     switch (normalized.kty) {
       case "oct": {
         if (typeof normalized.k !== "string" || !normalized.k) {
-          return yield* fail("InvalidArgument", "missing \"k\" (Key Value) Parameter value")
+          return yield* Effect.fail(malformedKey("missing \"k\" (Key Value) Parameter value"))
         }
         const bytes = b64uDecode(normalized.k)
-        if (bytes === undefined) return yield* fail("JwkInvalid", "Failed to base64url decode the \"k\" Parameter")
+        if (bytes === undefined) {
+          return yield* Effect.fail(malformedKey("Failed to base64url decode the \"k\" Parameter"))
+        }
         return bytes
       }
       case "RSA":
         if ("oth" in normalized && normalized.oth !== undefined) {
-          return yield* fail("NotSupported", "RSA JWK \"oth\" (Other Primes Info) Parameter value is not supported")
+          return yield* Effect.fail(
+            unsupportedKey("RSA JWK \"oth\" (Other Primes Info) Parameter value is not supported")
+          )
         }
         break
       case "EC":
       case "OKP":
         break
       default:
-        return yield* fail("NotSupported", "Unsupported \"kty\" (Key Type) Parameter value")
+        return yield* Effect.fail(unsupportedKey("Unsupported \"kty\" (Key Type) Parameter value"))
     }
     const entry = yield* attempt(() => entryFor(algorithm))
     return yield* jwkToKey(entry, normalized as Jwk, options?.extractable)
@@ -151,10 +425,10 @@ const pemToDer = (pem: string, label: string): Uint8Array => {
   const match = new RegExp(`^-----BEGIN ${label}-----\\s*([A-Za-z0-9+/=\\s]+?)\\s*-----END ${label}-----\\s*$`).exec(
     pem.trim()
   )
-  if (match === null) return failSync("InvalidArgument", `"pem" must be a PEM-encoded ${label}`)
+  if (match === null) return raise(malformedKey(`"pem" must be a PEM-encoded ${label}`))
   const base64 = match[1].replace(/\s+/g, "")
   const url = base64.replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")
-  return b64uDecode(url) ?? failSync("InvalidArgument", `"pem" must be a PEM-encoded ${label}`)
+  return b64uDecode(url) ?? raise(malformedKey(`"pem" must be a PEM-encoded ${label}`))
 }
 
 const derToPem = (der: Uint8Array, label: string): string => {
@@ -184,7 +458,7 @@ const curveOids: ReadonlyArray<readonly [string, ReadonlyArray<number>]> = [
 const algorithmForDer = (entry: KeyEntry, der: Uint8Array): Crypto.KeyAlgorithm => {
   if (entry.key !== undefined) return entry.key
   const crv = curveOids.find(([, oid]) => hasBytes(der, oid))?.[0]
-  if (crv === undefined) return failSync("NotSupported", "Invalid or unsupported key format")
+  if (crv === undefined) return raise(unsupportedKey("Unsupported key curve"))
   return entry.resolve!({ kty: crv === "X25519" ? "OKP" : "EC", crv })
 }
 
@@ -193,23 +467,22 @@ const importDer = (format: "spki" | "pkcs8", label: string) =>
   pem: string,
   alg: string,
   options?: { readonly extractable?: boolean | undefined }
-): Effect.Effect<Crypto.Key, JoseError, Crypto.Crypto> =>
+): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
-    if (typeof pem !== "string") return yield* fail("InvalidArgument", `"${format}" must be a string`)
+    if (typeof pem !== "string") return yield* Effect.die(new TypeError(`"${format}" must be a string`))
     const { entry, der, algorithm } = yield* attempt(() => {
       const entry = entryFor(alg)
-      if (entry.secret) failSync("InvalidArgument", `${format} keys cannot be used with ${alg}`)
+      if (entry.secret) raise(invalidKey(`${format} keys cannot be used with ${alg}`))
       const der = pemToDer(pem, label)
       return { entry, der, algorithm: algorithmForDer(entry, der) }
     })
     const crypto = yield* Crypto.Crypto
-    return yield* mapCryptoError(
+    return yield* mapPlatformError(
       crypto.importKey(format, der, algorithm, {
         extractable: options?.extractable ?? format === "spki",
         usages: entry.usages[format === "spki" ? 0 : 1]
       }),
-      "InvalidArgument",
-      "Invalid or unsupported key format"
+      (cause) => new MalformedKeyError({ message: "Invalid or unsupported key format", cause })
     )
   })
 
@@ -224,7 +497,7 @@ export const importSpki: (
   pem: string,
   alg: string,
   options?: { readonly extractable?: boolean | undefined }
-) => Effect.Effect<Crypto.Key, JoseError, Crypto.Crypto> = importDer("spki", "PUBLIC KEY")
+) => Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> = importDer("spki", "PUBLIC KEY")
 
 /**
  * Imports a PEM-encoded PKCS #8 private key for use with `alg`.
@@ -237,7 +510,7 @@ export const importPkcs8: (
   pem: string,
   alg: string,
   options?: { readonly extractable?: boolean | undefined }
-) => Effect.Effect<Crypto.Key, JoseError, Crypto.Crypto> = importDer("pkcs8", "PRIVATE KEY")
+) => Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> = importDer("pkcs8", "PRIVATE KEY")
 
 /**
  * Exports a key or raw secret as a JSON Web Key.
@@ -246,27 +519,25 @@ export const importPkcs8: (
  * @category exporting
  * @since 4.0.0
  */
-export const exportJwk = (key: Key): Effect.Effect<Jwk, JoseError, Crypto.Crypto> =>
+export const exportJwk = (key: Key): Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   Effect.gen(function*() {
     if (key instanceof Uint8Array) return { kty: "oct", k: b64u(key) }
-    if (!isCryptoKey(key)) return yield* fail("InvalidArgument", "Key must be a Crypto.Key or Uint8Array")
-    if (!key.extractable) return yield* fail("InvalidArgument", "non-extractable Key cannot be exported as a JWK")
+    if (!isCryptoKey(key)) return yield* Effect.die(new TypeError("Key must be a Crypto.Key or Uint8Array"))
+    if (!key.extractable) return yield* Effect.fail(invalidKey("non-extractable Key cannot be exported as a JWK"))
     const crypto = yield* Crypto.Crypto
-    const { ext: _ext, key_ops: _ops, alg: _alg, use: _use, ...jwk } = yield* mapCryptoError(
-      crypto.exportKey("jwk", key)
-    )
+    const { ext: _ext, key_ops: _ops, alg: _alg, use: _use, ...jwk } = yield* crypto.exportKey("jwk", key)
     return jwk as Jwk
   })
 
 const exportDer =
   (format: "spki" | "pkcs8", label: string, type: Crypto.Key["type"]) =>
-  (key: Crypto.Key): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+  (key: Crypto.Key): Effect.Effect<string, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
     Effect.gen(function*() {
-      if (!isCryptoKey(key)) return yield* fail("InvalidArgument", "Key must be a Crypto.Key")
-      if (!key.extractable) return yield* fail("InvalidArgument", "Key must be extractable")
-      if (key.type !== type) return yield* fail("InvalidArgument", `key is not a ${type} key`)
+      if (!isCryptoKey(key)) return yield* Effect.die(new TypeError("Key must be a Crypto.Key"))
+      if (!key.extractable) return yield* Effect.fail(invalidKey("Key must be extractable"))
+      if (key.type !== type) return yield* Effect.fail(invalidKey(`key is not a ${type} key`))
       const crypto = yield* Crypto.Crypto
-      return derToPem(yield* mapCryptoError(crypto.exportKey(format, key)), label)
+      return derToPem(yield* crypto.exportKey(format, key), label)
     })
 
 /**
@@ -276,7 +547,9 @@ const exportDer =
  * @category exporting
  * @since 4.0.0
  */
-export const exportSpki: (key: Crypto.Key) => Effect.Effect<string, JoseError, Crypto.Crypto> = exportDer(
+export const exportSpki: (
+  key: Crypto.Key
+) => Effect.Effect<string, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> = exportDer(
   "spki",
   "PUBLIC KEY",
   "public"
@@ -289,7 +562,9 @@ export const exportSpki: (key: Crypto.Key) => Effect.Effect<string, JoseError, C
  * @category exporting
  * @since 4.0.0
  */
-export const exportPkcs8: (key: Crypto.Key) => Effect.Effect<string, JoseError, Crypto.Crypto> = exportDer(
+export const exportPkcs8: (
+  key: Crypto.Key
+) => Effect.Effect<string, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> = exportDer(
   "pkcs8",
   "PRIVATE KEY",
   "private"
@@ -327,18 +602,17 @@ export interface GenerateKeyPairOptions {
 export const generateKeyPair = (
   alg: string,
   options?: GenerateKeyPairOptions
-): Effect.Effect<Crypto.KeyPair, JoseError, Crypto.Crypto> =>
+): Effect.Effect<Crypto.KeyPair, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
     const { algorithm, usages } = yield* attempt(() => {
       const entry = entryFor(alg)
-      if (entry.secret) failSync("NotSupported", "Invalid or unsupported JWK \"alg\" (Algorithm) Parameter value")
+      if (entry.secret) {
+        raise(new UnsupportedAlgorithmError({ algorithm: alg, message: `${alg} uses a secret; use generateSecret` }))
+      }
       const modulusLength = options?.modulusLength ?? 2048
       if (entry.key !== undefined && "hash" in entry.key && entry.key.name !== "HMAC") {
         if (!Number.isSafeInteger(modulusLength) || modulusLength < 2048) {
-          failSync(
-            "NotSupported",
-            "Invalid or unsupported modulusLength option provided, 2048 bits or larger keys must be used"
-          )
+          raise(unsupportedKey("RSA keys smaller than 2048 bits are not supported"))
         }
       }
       const algorithm: Crypto.KeyAlgorithm = entry.key === undefined
@@ -349,9 +623,7 @@ export const generateKeyPair = (
       return { algorithm, usages: [...entry.usages[0], ...entry.usages[1]] }
     })
     const crypto = yield* Crypto.Crypto
-    const generated = yield* mapCryptoError(
-      crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages })
-    )
+    const generated = yield* crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages })
     return generated as Crypto.KeyPair
   })
 
@@ -370,14 +642,16 @@ export const generateKeyPair = (
 export const generateSecret = (
   alg: string,
   options?: { readonly extractable?: boolean | undefined }
-): Effect.Effect<Key, JoseError, Crypto.Crypto> =>
+): Effect.Effect<Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
     const crypto = yield* Crypto.Crypto
     const enc = ENC[alg]
-    if (enc !== undefined && enc.cbc) return yield* mapCryptoError(crypto.randomBytes(enc.cekBits >> 3))
-    const entry = yield* attempt(() => entryFor(alg))
+    if (enc !== undefined && enc.cbc) return yield* crypto.randomBytes(enc.cekBits >> 3)
+    const entry = yield* attemptWith<UnsupportedAlgorithmError | InvalidKeyError>()(() => entryFor(alg))
     if (!entry.secret || entry.key === undefined || entry.key.name === "PBKDF2") {
-      return yield* fail("NotSupported", "Invalid or unsupported JWK \"alg\" (Algorithm) Parameter value")
+      return yield* Effect.fail(
+        new UnsupportedAlgorithmError({ algorithm: alg, message: `${alg} does not use a secret key` })
+      )
     }
     const algorithm: Crypto.KeyAlgorithm = entry.key.name === "HMAC"
       ? { ...entry.key, length: Number.parseInt(entry.key.hash.slice(-3), 10) }
@@ -387,14 +661,12 @@ export const generateSecret = (
       : entry.key.name === "AES-KW"
       ? ["wrapKey", "unwrapKey"]
       : ["encrypt", "decrypt"]
-    return (yield* mapCryptoError(
-      crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages })
-    )) as Crypto.Key
+    return (yield* crypto.generateKey(algorithm, { extractable: options?.extractable ?? false, usages })) as Crypto.Key
   })
 
 const required = (jwk: Record<string, unknown>, name: string, description: string): string => {
   const value = jwk[name]
-  if (typeof value !== "string" || !value) return failSync("JwkInvalid", `${description} missing or invalid`)
+  if (typeof value !== "string" || !value) return raise(malformedKey(`${description} missing or invalid`))
   return value
 }
 
@@ -422,12 +694,12 @@ export type ThumbprintDigest = "sha256" | "sha384" | "sha512"
 export const thumbprint = (
   key: Jwk | Key,
   digest: ThumbprintDigest = "sha256"
-): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+): Effect.Effect<string, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
     const jwk: Record<string, unknown> = isObject(key) ? { ...key } : yield* exportJwk(key as Key)
-    if (typeof jwk.kty !== "string") return yield* fail("InvalidArgument", "Key must be a Crypto.Key or JSON Web Key")
+    if (typeof jwk.kty !== "string") return yield* Effect.die(new TypeError("Key must be a Crypto.Key or JSON Web Key"))
     if (digest !== "sha256" && digest !== "sha384" && digest !== "sha512") {
-      return yield* fail("InvalidArgument", "digest must one of \"sha256\", \"sha384\", or \"sha512\"")
+      return yield* Effect.die(new TypeError("digest must one of \"sha256\", \"sha384\", or \"sha512\""))
     }
     const components = yield* attempt((): Record<string, string> => {
       switch (jwk.kty) {
@@ -451,15 +723,16 @@ export const thumbprint = (
             n: required(jwk, "n", "\"n\" (Modulus) Parameter")
           }
         case "oct":
-          if (typeof jwk.k !== "string") return failSync("JwkInvalid", "\"k\" (Key Value) Parameter missing or invalid")
+          if (typeof jwk.k !== "string") return raise(malformedKey("\"k\" (Key Value) Parameter missing or invalid"))
           return { k: jwk.k, kty: "oct" }
         default:
-          return failSync("NotSupported", "\"kty\" (Key Type) Parameter missing or unsupported")
+          return raise(unsupportedKey("\"kty\" (Key Type) Parameter missing or unsupported"))
       }
     })
     const crypto = yield* Crypto.Crypto
-    const hash = yield* mapCryptoError(
-      crypto.digest(`SHA-${digest.slice(-3)}` as Crypto.DigestAlgorithm, encoder.encode(JSON.stringify(components)))
+    const hash = yield* crypto.digest(
+      `SHA-${digest.slice(-3)}` as Crypto.DigestAlgorithm,
+      encoder.encode(JSON.stringify(components))
     )
     return b64u(hash)
   })
@@ -474,7 +747,7 @@ export const thumbprint = (
 export const thumbprintUri = (
   key: Jwk | Key,
   digest: ThumbprintDigest = "sha256"
-): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+): Effect.Effect<string, KeyError, Crypto.Crypto> =>
   Effect.map(
     thumbprint(key, digest),
     (value) => `urn:ietf:params:oauth:jwk-thumbprint:sha-${digest.slice(-3)}:${value}`

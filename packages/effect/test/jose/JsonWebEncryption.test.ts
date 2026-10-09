@@ -121,11 +121,11 @@ describe("JsonWebEncryption", () => {
         keyManagementParameters: { p2c: 20_000 }
       })
       const notAllowed = yield* Effect.flip(JsonWebEncryption.decryptCompact(jwe, password))
-      assert.strictEqual(notAllowed.reason, "AlgorithmNotAllowed")
+      assert.strictEqual(notAllowed._tag, "AlgorithmNotAllowedError")
       const tooMany = yield* Effect.flip(
         JsonWebEncryption.decryptCompact(jwe, password, { keyManagementAlgorithms: ["PBES2-HS256+A128KW"] })
       )
-      assert.strictEqual(tooMany.reason, "JweInvalid")
+      assert.strictEqual(tooMany._tag, "MalformedJweError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("fails uniformly when the wrong key is used", () =>
@@ -137,7 +137,7 @@ describe("JsonWebEncryption", () => {
         protectedHeader: { alg: "RSA-OAEP-256", enc: "A256GCM" }
       })
       const error = yield* Effect.flip(JsonWebEncryption.decryptCompact(jwe, b.privateKey))
-      assert.strictEqual(error.reason, "DecryptionFailed")
+      assert.strictEqual(error._tag, "DecryptionError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("encrypts to several recipients with general JSON", () =>
@@ -164,7 +164,7 @@ describe("JsonWebEncryption", () => {
         key,
         protectedHeader: { alg: "A128KW", enc: "A128GCM", zip: "DEF" }
       }))
-      assert.strictEqual(error.reason, "NotSupported")
+      assert.strictEqual(error._tag, "UnsupportedJweHeaderError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("accepts a private JWK as the ECDH-ES ephemeral key", () =>

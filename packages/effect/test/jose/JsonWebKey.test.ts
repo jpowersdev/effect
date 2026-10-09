@@ -66,12 +66,12 @@ describe("JsonWebKeySet", () => {
         protectedHeader: { alg: "ES256" }
       })
       const multiple = yield* Effect.flip(JsonWebSignature.verifyCompact(ambiguous, resolver))
-      assert.strictEqual(multiple.reason, "MultipleMatchingKeys")
+      assert.strictEqual(multiple._tag, "MultipleMatchingKeysError")
       const symmetric = yield* JsonWebSignature.signCompact("x", {
         key: utf8("s".repeat(32)),
         protectedHeader: { alg: "HS256" }
       })
       const unsupported = yield* Effect.flip(JsonWebSignature.verifyCompact(symmetric, resolver))
-      assert.strictEqual(unsupported.reason, "NotSupported")
+      assert.strictEqual(unsupported._tag, "UnsupportedAlgorithmError")
     }).pipe(Effect.provide(CryptoLive)))
 })

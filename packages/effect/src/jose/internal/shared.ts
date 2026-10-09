@@ -1,7 +1,6 @@
 import type * as Crypto from "../../Crypto.ts"
 import * as Effect from "../../Effect.ts"
-import * as PlatformError from "../../PlatformError.ts"
-import { JoseError, type JoseErrorReason } from "../JoseError.ts"
+import type * as PlatformError from "../../PlatformError.ts"
 
 /** @internal */
 export const encoder = new TextEncoder()
@@ -9,49 +8,52 @@ export const encoder = new TextEncoder()
 /** @internal */
 export const strictDecoder = new TextDecoder("utf-8", { fatal: true })
 
-/** @internal */
-export const error = (reason: JoseErrorReason, message: string, cause?: unknown): JoseError =>
-  new JoseError(cause === undefined ? { reason, message } : { reason, message, cause })
-
-/** @internal */
-export const fail = (reason: JoseErrorReason, message: string, cause?: unknown) =>
-  Effect.fail(error(reason, message, cause))
-
-/** @internal */
-export const failSync = (reason: JoseErrorReason, message: string): never => {
-  throw error(reason, message)
-}
-
 /**
- * Runs a synchronous validation that throws `JoseError`, capturing the error
- * in the failure channel.
+ * Builds an error from a message. Shared helpers take one of these so each
+ * module raises its own error type.
  *
  * @internal
  */
-export const attempt = <A>(f: () => A): Effect.Effect<A, JoseError> =>
+export type MakeError<E> = (message: string) => E
+
+/**
+ * Throws a tagged error from synchronous validation code; {@link attempt}
+ * moves it to the failure channel.
+ *
+ * @internal
+ */
+export const raise = (error: unknown): never => {
+  throw error
+}
+
+/**
+ * Runs synchronous validation that throws tagged errors, capturing them in
+ * the failure channel with type `E`. Anything else thrown is a defect.
+ *
+ * @internal
+ */
+export const attemptWith = <E>() => <A>(f: () => A): Effect.Effect<A, E> =>
   Effect.suspend(() => {
     try {
       return Effect.succeed(f())
     } catch (e) {
-      return e instanceof JoseError ? Effect.fail(e) : Effect.die(e)
+      return typeof e === "object" && e !== null && typeof (e as { _tag?: unknown })._tag === "string"
+        ? Effect.fail(e as E)
+        : Effect.die(e)
     }
   })
 
-/** @internal */
-export const mapCryptoError = <A, R>(
-  effect: Effect.Effect<A, PlatformError.PlatformError | JoseError, R>,
-  reason: JoseErrorReason = "CryptoFailure",
-  message?: string
-): Effect.Effect<A, JoseError, R> =>
-  Effect.mapError(
-    effect,
-    (e) =>
-      e instanceof JoseError ? e : error(
-        PlatformError.isPlatformError(e) && e.reason._tag === "BadArgument" ? "InvalidKey" : reason,
-        message ?? e.message,
-        e
-      )
-  )
+/**
+ * Maps a platform failure to a more specific error, leaving other platform
+ * failures as `PlatformError`.
+ *
+ * @internal
+ */
+export const mapPlatformError = <A, E, R, E2>(
+  effect: Effect.Effect<A, E | PlatformError.PlatformError, R>,
+  f: (error: PlatformError.PlatformError) => E2
+): Effect.Effect<A, Exclude<E, PlatformError.PlatformError> | E2, R> =>
+  Effect.mapError(effect, (e: any) => (e?._tag === "PlatformError" ? f(e) : e)) as any
 
 /** @internal */
 export const concat = (...buffers: ReadonlyArray<Uint8Array>): Uint8Array => {
@@ -157,11 +159,11 @@ export const b64uDecode = (input: string): Uint8Array | undefined => {
 }
 
 /** @internal */
-export const decodeB64u = (
+export const decodeB64u = <E>(
   value: string,
   label: string,
-  reason: JoseErrorReason
-): Uint8Array => b64uDecode(value) ?? failSync(reason, `Failed to base64url decode the ${label}`)
+  make: MakeError<E>
+): Uint8Array => b64uDecode(value) ?? raise(make(`Failed to base64url decode the ${label}`))
 
 /** @internal */
 export const isObject = (input: unknown): input is Record<string, unknown> => {
@@ -186,34 +188,34 @@ export const isDisjoint = (...headers: ReadonlyArray<object | undefined>): boole
 }
 
 /** @internal */
-export const parseHeader = (
+export const parseHeader = <E>(
   encoded: string,
-  reason: JoseErrorReason,
+  make: MakeError<E>,
   message: string
 ): Record<string, unknown> => {
   let parsed: unknown
   try {
     const bytes = b64uDecode(encoded)
-    if (bytes === undefined) return failSync(reason, message)
+    if (bytes === undefined) return raise(make(message))
     parsed = JSON.parse(strictDecoder.decode(bytes))
   } catch {
-    return failSync(reason, message)
+    return raise(make(message))
   }
-  if (!isObject(parsed)) return failSync(reason, message)
+  if (!isObject(parsed)) return raise(make(message))
   return parsed
 }
 
 /** @internal */
-export const serializeHeader = (reason: JoseErrorReason, header: unknown): [Record<string, unknown>, string] => {
+export const serializeHeader = <E>(make: MakeError<E>, header: unknown): [Record<string, unknown>, string] => {
   let serialized: string
   let parsed: unknown
   try {
     serialized = JSON.stringify(header)
     parsed = JSON.parse(serialized)
-  } catch (cause) {
-    throw error(reason, "JOSE Header is not valid JSON", cause)
+  } catch {
+    return raise(make("JOSE Header is not valid JSON"))
   }
-  if (!isObject(parsed)) return failSync(reason, "JOSE Header is not a JSON object")
+  if (!isObject(parsed)) return raise(make("JOSE Header is not a JSON object"))
   return [parsed, serialized]
 }
 
@@ -232,15 +234,16 @@ export const JWE_RECOGNIZED: Readonly<Record<string, boolean>> = { __proto__: nu
  *
  * @internal
  */
-export const validateCrit = (
-  reason: JoseErrorReason,
+export const validateCrit = <E1, E2>(
+  malformed: MakeError<E1>,
+  unsupported: MakeError<E2>,
   recognizedDefault: Readonly<Record<string, boolean>>,
   recognizedOption: Readonly<Record<string, boolean>> | undefined,
   protectedHeader: Record<string, unknown> | undefined,
   joseHeader: Record<string, unknown>
 ): ReadonlyArray<string> => {
   if (joseHeader.crit !== undefined && protectedHeader?.crit === undefined) {
-    return failSync(reason, "\"crit\" (Critical) Header Parameter MUST be integrity protected")
+    return raise(malformed("\"crit\" (Critical) Header Parameter MUST be integrity protected"))
   }
   if (protectedHeader === undefined || protectedHeader.crit === undefined) return []
   const crit = protectedHeader.crit
@@ -248,36 +251,40 @@ export const validateCrit = (
     !Array.isArray(crit) || crit.length === 0 ||
     crit.some((input) => typeof input !== "string" || input.length === 0)
   ) {
-    return failSync(reason, "\"crit\" (Critical) Header Parameter MUST be an array of non-empty strings when present")
+    return raise(malformed("\"crit\" (Critical) Header Parameter MUST be an array of non-empty strings when present"))
   }
   if (new Set(crit).size !== crit.length) {
-    return failSync(reason, "\"crit\" (Critical) Header Parameter MUST NOT contain duplicate values")
+    return raise(malformed("\"crit\" (Critical) Header Parameter MUST NOT contain duplicate values"))
   }
   const recognized: Record<string, boolean> = recognizedOption === undefined
     ? recognizedDefault
     : { __proto__: null, ...recognizedOption, ...recognizedDefault } as any
   for (const parameter of crit as Array<string>) {
     if (!(parameter in recognized)) {
-      return failSync("NotSupported", `Extension Header Parameter "${parameter}" is not recognized`)
+      return raise(unsupported(`Extension Header Parameter "${parameter}" is not recognized`))
     }
     if (!Object.hasOwn(joseHeader, parameter) || joseHeader[parameter] === undefined) {
-      return failSync(reason, `Extension Header Parameter "${parameter}" is missing`)
+      return raise(malformed(`Extension Header Parameter "${parameter}" is missing`))
     }
     if (
       recognized[parameter] && (!Object.hasOwn(protectedHeader, parameter) || protectedHeader[parameter] === undefined)
     ) {
-      return failSync(reason, `Extension Header Parameter "${parameter}" MUST be integrity protected`)
+      return raise(malformed(`Extension Header Parameter "${parameter}" MUST be integrity protected`))
     }
   }
   return crit as Array<string>
 }
 
 /** @internal */
-export const validateB64 = (protectedHeader: Record<string, unknown>, extensions: ReadonlyArray<string>): boolean => {
+export const validateB64 = <E>(
+  malformed: MakeError<E>,
+  protectedHeader: Record<string, unknown>,
+  extensions: ReadonlyArray<string>
+): boolean => {
   if (extensions.includes("b64")) {
     const b64 = protectedHeader.b64
     if (typeof b64 !== "boolean") {
-      return failSync("JwsInvalid", "The \"b64\" (base64url-encode payload) Header Parameter must be a boolean")
+      return raise(malformed("The \"b64\" (base64url-encode payload) Header Parameter must be a boolean"))
     }
     return b64
   }
@@ -291,7 +298,7 @@ export const validateAlgorithms = (
 ): ReadonlySet<string> | undefined => {
   if (algorithms === undefined) return undefined
   if (!Array.isArray(algorithms) || algorithms.some((s) => typeof s !== "string")) {
-    return failSync("InvalidArgument", `"${option}" option must be an array of strings`)
+    throw new TypeError(`"${option}" option must be an array of strings`)
   }
   return new Set(algorithms)
 }

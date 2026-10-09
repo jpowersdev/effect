@@ -32,7 +32,7 @@ describe("JsonWebToken", () => {
       yield* JsonWebToken.verify(token, secret, options)
       yield* TestClock.adjust("1 hour")
       const expired = yield* Effect.flip(JsonWebToken.verify(token, secret, options))
-      assert.strictEqual(expired.reason, "Expired")
+      assert(expired._tag === "TokenExpiredError")
       assert.strictEqual(expired.claim, "exp")
       yield* JsonWebToken.verify(token, secret, { ...options, clockTolerance: "1 second" })
     }).pipe(Effect.provide([CryptoLive, TestClock.layer()])))
@@ -41,12 +41,14 @@ describe("JsonWebToken", () => {
     Effect.gen(function*() {
       const token = yield* JsonWebToken.sign({ sub: "u1" }, { key: secret, protectedHeader: { alg: "HS256" } })
       const issuer = yield* Effect.flip(JsonWebToken.verify(token, secret, { issuer: "urn:other" }))
-      assert.strictEqual(issuer.reason, "ClaimValidationFailed")
+      assert(issuer._tag === "ClaimValidationError")
       assert.strictEqual(issuer.claim, "iss")
       assert.strictEqual(issuer.check, "missing")
       const subject = yield* Effect.flip(JsonWebToken.verify(token, secret, { subject: "u2" }))
+      assert(subject._tag === "ClaimValidationError")
       assert.strictEqual(subject.check, "check_failed")
       const required = yield* Effect.flip(JsonWebToken.verify(token, secret, { requiredClaims: ["jti"] }))
+      assert(required._tag === "ClaimValidationError")
       assert.strictEqual(required.claim, "jti")
     }).pipe(Effect.provide(CryptoLive)))
 
@@ -61,7 +63,7 @@ describe("JsonWebToken", () => {
       assert.strictEqual(payload.role, "user")
       const bad = yield* JsonWebToken.sign({ role: "root" }, { key: secret, protectedHeader: { alg: "HS256" } })
       const error = yield* Effect.flip(JsonWebToken.verify(bad, secret, { schema: Claims }))
-      assert.strictEqual(error.reason, "ClaimValidationFailed")
+      assert.strictEqual(error._tag, "ClaimValidationError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("rejects unencoded payloads", () =>
@@ -70,7 +72,7 @@ describe("JsonWebToken", () => {
         key: secret,
         protectedHeader: { alg: "HS256", b64: false, crit: ["b64"] }
       }))
-      assert.strictEqual(error.reason, "JwtInvalid")
+      assert.strictEqual(error._tag, "MalformedJwtError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("encrypts and decrypts tokens with replicated claims", () =>

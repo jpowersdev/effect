@@ -18,11 +18,106 @@ import type * as HttpClientError from "../http/HttpClientError.ts"
 import * as Schema from "../Schema.ts"
 import * as Semaphore from "../Semaphore.ts"
 import { JWS } from "./internal/algorithms.ts"
-import { jwkToKey } from "./internal/key.ts"
-import { error, fail, isObject } from "./internal/shared.ts"
-import { isJoseError, type JoseError } from "./JoseError.ts"
+import { isObject } from "./internal/shared.ts"
+import { UnsupportedAlgorithmError } from "./JsonWebAlgorithm.ts"
 import * as JsonWebKey from "./JsonWebKey.ts"
 import type * as JsonWebSignature from "./JsonWebSignature.ts"
+
+/**
+ * Error raised when a key set is malformed: it is not an object with a
+ * `keys` array of objects, or a selected member is not a public key.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class MalformedKeySetError
+  extends Schema.TaggedError<MalformedKeySetError>("effect/jose/JsonWebKeySet/MalformedKeySetError")(
+    "MalformedKeySetError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Error raised when no key in the set matches the token's `alg` and `kid`.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class NoMatchingKeyError
+  extends Schema.TaggedError<NoMatchingKeyError>("effect/jose/JsonWebKeySet/NoMatchingKeyError")(
+    "NoMatchingKeyError",
+    { message: Schema.String, kid: Schema.optional(Schema.String) }
+  )
+{}
+
+/**
+ * Error raised when more than one key in the set matches the token, usually
+ * because the token has no `kid`.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class MultipleMatchingKeysError
+  extends Schema.TaggedError<MultipleMatchingKeysError>("effect/jose/JsonWebKeySet/MultipleMatchingKeysError")(
+    "MultipleMatchingKeysError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Error raised when a remote key set cannot be fetched or does not respond
+ * with `200 OK`.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class KeySetFetchError
+  extends Schema.TaggedError<KeySetFetchError>("effect/jose/JsonWebKeySet/KeySetFetchError")(
+    "KeySetFetchError",
+    { message: Schema.String, url: Schema.String, cause: Schema.optional(Schema.Defect()) }
+  )
+{}
+
+/**
+ * Error raised when fetching a remote key set exceeds `timeoutDuration`.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class KeySetTimeoutError
+  extends Schema.TaggedError<KeySetTimeoutError>("effect/jose/JsonWebKeySet/KeySetTimeoutError")(
+    "KeySetTimeoutError",
+    { message: Schema.String, url: Schema.String }
+  )
+{}
+
+/**
+ * Failures from selecting a key from a key set.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type SelectError =
+  | MalformedKeySetError
+  | NoMatchingKeyError
+  | MultipleMatchingKeysError
+  | UnsupportedAlgorithmError
+  | JsonWebKey.KeyError
+
+/**
+ * Failures from selecting a key from a remote key set.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type RemoteSelectError = SelectError | KeySetFetchError | KeySetTimeoutError
 
 /**
  * A JSON Web Key Set.
@@ -51,7 +146,7 @@ export const JwkSet = Schema.Struct({ keys: Schema.Array(JsonWebKey.Jwk) })
  * @category models
  * @since 4.0.0
  */
-export type Resolver = JsonWebSignature.KeyResolver<JoseError, Crypto.Crypto>
+export type Resolver<E = SelectError> = JsonWebSignature.KeyResolver<E, Crypto.Crypto>
 
 const isJwkSet = (input: unknown): input is JwkSet =>
   isObject(input) && Array.isArray(input.keys) && input.keys.every(isObject)
@@ -89,7 +184,7 @@ const isUsable = (jwk: Record<string, unknown>, entry: (typeof JWS)[string], alg
  * @category constructors
  * @since 4.0.0
  */
-export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, JoseError> =>
+export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, MalformedKeySetError> =>
   Effect.suspend(() => {
     let snapshot: unknown
     try {
@@ -97,7 +192,7 @@ export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, JoseError> =>
     } catch {
       // reported below
     }
-    if (!isJwkSet(snapshot)) return fail("JwksInvalid", "JSON Web Key Set malformed")
+    if (!isJwkSet(snapshot)) return Effect.fail(new MalformedKeySetError({ message: "JSON Web Key Set malformed" }))
     const keys = snapshot.keys as ReadonlyArray<Record<string, unknown>>
     const cache = new Map<string, Crypto.Key>()
     const resolver: Resolver = (protectedHeader, token) =>
@@ -105,24 +200,38 @@ export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, JoseError> =>
         const { alg, kid } = { ...protectedHeader, ...token?.header }
         const entry = typeof alg === "string" ? JWS[alg] : undefined
         if (!entry || entry.secret) {
-          return yield* fail("NotSupported", "Unsupported \"alg\" value for a JSON Web Key Set")
+          return yield* Effect.fail(
+            new UnsupportedAlgorithmError({
+              ...(typeof alg === "string" ? { algorithm: alg } : {}),
+              message: "Unsupported \"alg\" value for a JSON Web Key Set"
+            })
+          )
         }
         const candidates: Array<number> = []
         keys.forEach((jwk, index) => {
           if (isUsable(jwk, entry, alg as string, kid)) candidates.push(index)
         })
         if (candidates.length === 0) {
-          return yield* fail("NoMatchingKey", "no applicable key found in the JSON Web Key Set")
+          return yield* Effect.fail(
+            new NoMatchingKeyError({
+              ...(typeof kid === "string" ? { kid } : {}),
+              message: "no applicable key found in the JSON Web Key Set"
+            })
+          )
         }
         if (candidates.length > 1) {
-          return yield* fail("MultipleMatchingKeys", "multiple matching keys found in the JSON Web Key Set")
+          return yield* Effect.fail(
+            new MultipleMatchingKeysError({ message: "multiple matching keys found in the JSON Web Key Set" })
+          )
         }
         const cacheKey = `${candidates[0]}:${entry.alg}`
         const cached = cache.get(cacheKey)
         if (cached) return cached
-        const key = yield* jwkToKey(entry, keys[candidates[0]] as Crypto.JwkData, true)
+        const key = yield* JsonWebKey.jwkToKey(entry, keys[candidates[0]] as Crypto.JwkData, true)
         if (key.type !== "public") {
-          return yield* fail("JwksInvalid", "JSON Web Key Set members must be public keys")
+          return yield* Effect.fail(
+            new MalformedKeySetError({ message: "JSON Web Key Set members must be public keys" })
+          )
         }
         cache.set(cacheKey, key)
         return key
@@ -170,7 +279,7 @@ export interface RemoteOptions {
 export const makeRemote = (
   url: string | URL,
   options?: RemoteOptions
-): Effect.Effect<Resolver, never, HttpClient.HttpClient> =>
+): Effect.Effect<Resolver<RemoteSelectError>, never, HttpClient.HttpClient> =>
   Effect.gen(function*() {
     const client = yield* HttpClient.HttpClient
     const cacheMaxAge = Duration.toMillis(options?.cacheMaxAge ?? Duration.minutes(10))
@@ -180,22 +289,34 @@ export const makeRemote = (
     let local: Resolver | undefined
     let fetchedAt = -Infinity
 
-    const fetchSet: Effect.Effect<unknown, JoseError> = client.get(url, {
+    const href = url.toString()
+    const fetchSet: Effect.Effect<unknown, KeySetFetchError | KeySetTimeoutError> = client.get(url, {
       headers: { accept: "application/json", ...options?.headers }
     }).pipe(
-      Effect.flatMap((response): Effect.Effect<unknown, JoseError | HttpClientError.HttpClientError> =>
+      Effect.flatMap((response): Effect.Effect<unknown, KeySetFetchError | HttpClientError.HttpClientError> =>
         response.status === 200
           ? response.json
-          : fail("JwksFetchFailed", "Expected 200 OK from the JSON Web Key Set HTTP response")
+          : Effect.fail(
+            new KeySetFetchError({
+              url: href,
+              message: `Expected 200 OK from the JSON Web Key Set HTTP response, received ${response.status}`
+            })
+          )
       ),
-      Effect.mapError((e) => isJoseError(e) ? e : error("JwksFetchFailed", "Failed to fetch the JSON Web Key Set", e)),
+      Effect.mapError((e) =>
+        e._tag === "KeySetFetchError"
+          ? e
+          : new KeySetFetchError({ url: href, message: "Failed to fetch the JSON Web Key Set", cause: e })
+      ),
       Effect.timeoutOrElse({
         duration: timeout,
-        orElse: () => fail("JwksTimeout", "request timed out")
+        orElse: () => Effect.fail(new KeySetTimeoutError({ url: href, message: "request timed out" }))
       })
     )
 
-    const reload = (force: boolean): Effect.Effect<Resolver, JoseError> =>
+    const reload = (
+      force: boolean
+    ): Effect.Effect<Resolver, MalformedKeySetError | KeySetFetchError | KeySetTimeoutError> =>
       lock.withPermit(Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         if (!force && local !== undefined && now - fetchedAt < cacheMaxAge) return local
@@ -205,12 +326,12 @@ export const makeRemote = (
         return local
       }))
 
-    const resolver: Resolver = (protectedHeader, token) =>
+    const resolver: Resolver<RemoteSelectError> = (protectedHeader, token) =>
       Effect.gen(function*() {
         const resolve = yield* reload(false)
         const result = yield* Effect.result(resolve(protectedHeader, token))
         if (result._tag === "Success") return result.success
-        if (result.failure.reason !== "NoMatchingKey") return yield* Effect.fail(result.failure)
+        if (result.failure._tag !== "NoMatchingKeyError") return yield* Effect.fail(result.failure)
         const now = yield* Clock.currentTimeMillis
         if (now - fetchedAt < cooldown) return yield* Effect.fail(result.failure)
         const fresh = yield* reload(true)

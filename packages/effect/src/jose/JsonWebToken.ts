@@ -15,10 +15,115 @@ import type * as Crypto from "../Crypto.ts"
 import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
 import * as Schema from "../Schema.ts"
-import { attempt, fail, failSync, isObject, parseHeader, strictDecoder } from "./internal/shared.ts"
-import { JoseError } from "./JoseError.ts"
+import { attemptWith, isObject, parseHeader, raise, strictDecoder } from "./internal/shared.ts"
 import * as JsonWebEncryption from "./JsonWebEncryption.ts"
 import * as JsonWebSignature from "./JsonWebSignature.ts"
+
+/**
+ * Error raised when a token is not a valid JWT: its payload is not a JSON
+ * object, it uses an unencoded payload, or it is not in compact
+ * serialization.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class MalformedJwtError
+  extends Schema.TaggedError<MalformedJwtError>("effect/jose/JsonWebToken/MalformedJwtError")(
+    "MalformedJwtError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Describes which check failed for a {@link ClaimValidationError}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type ClaimCheck = "missing" | "invalid" | "check_failed"
+
+/**
+ * Error raised when a JWT claim or header fails validation: a required claim
+ * is missing, a claim has the wrong type, `iss`, `sub`, `aud`, or `typ` does
+ * not match, `nbf` is in the future, `iat` is in the future, or the claims do
+ * not match the provided schema.
+ *
+ * **Details**
+ *
+ * `claim` names the failing claim, when there is one. `check` describes
+ * whether it was missing, had an invalid type, or failed comparison.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class ClaimValidationError
+  extends Schema.TaggedError<ClaimValidationError>("effect/jose/JsonWebToken/ClaimValidationError")(
+    "ClaimValidationError",
+    {
+      message: Schema.String,
+      claim: Schema.optional(Schema.String),
+      check: Schema.Literals(["missing", "invalid", "check_failed"]),
+      cause: Schema.optional(Schema.Defect())
+    }
+  )
+{}
+
+/**
+ * Error raised when a JWT has expired: its `exp` is not in the future, or its
+ * `iat` is older than `maxTokenAge`, after allowing for `clockTolerance`.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class TokenExpiredError
+  extends Schema.TaggedError<TokenExpiredError>("effect/jose/JsonWebToken/TokenExpiredError")(
+    "TokenExpiredError",
+    { message: Schema.String, claim: Schema.Literals(["exp", "iat"]) }
+  )
+{}
+
+/**
+ * Failures from issuing a signed JWT.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type SignError = JsonWebSignature.SignError | MalformedJwtError
+
+/**
+ * Failures from validating a JWT's claims.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type ClaimsError = MalformedJwtError | ClaimValidationError | TokenExpiredError
+
+/**
+ * Failures from verifying a signed JWT.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type VerifyError = JsonWebSignature.VerifyError | ClaimsError
+
+/**
+ * Failures from decrypting an encrypted JWT.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type DecryptError = JsonWebEncryption.DecryptError | ClaimsError
+
+const malformed = (message: string) => new MalformedJwtError({ message })
+const attemptClaims = attemptWith<ClaimsError>()
 
 /**
  * A JWT claims set with the registered claims typed.
@@ -164,28 +269,28 @@ const epoch = (millis: number) => Math.floor(millis / 1000)
 
 const resolveTime = (label: string, value: Time, now: number): number => {
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) return failSync("InvalidArgument", `Invalid ${label} input`)
+    if (!Number.isFinite(value)) throw new TypeError(`Invalid ${label} input`)
     return value
   }
   if (value instanceof Date) {
     const millis = value.getTime()
-    if (!Number.isFinite(millis)) return failSync("InvalidArgument", `Invalid ${label} input`)
+    if (!Number.isFinite(millis)) throw new TypeError(`Invalid ${label} input`)
     return epoch(millis)
   }
   const duration = Duration.fromInput(value)
   if (duration._tag === "None" || !Duration.isFinite(duration.value)) {
-    return failSync("InvalidArgument", `Invalid ${label} input`)
+    throw new TypeError(`Invalid ${label} input`)
   }
   return epoch(now) + Math.round(Duration.toSeconds(duration.value))
 }
 
 const validateString = (claim: string, value: unknown) => {
-  if (typeof value !== "string") failSync("InvalidArgument", `"${claim}" claim must be a string`)
+  if (typeof value !== "string") throw new TypeError(`"${claim}" claim must be a string`)
 }
 
 /** @internal */
 export const buildClaims = (claims: Claims, options: IssueOptions, now: number): Uint8Array => {
-  if (!isObject(claims)) return failSync("InvalidArgument", "JWT Claims Set MUST be an object")
+  if (!isObject(claims)) throw new TypeError("JWT Claims Set MUST be an object")
   const payload: Record<string, unknown> = structuredClone(claims)
   if (options.issuer !== undefined) {
     validateString("iss", options.issuer)
@@ -198,7 +303,7 @@ export const buildClaims = (claims: Claims, options: IssueOptions, now: number):
   if (options.audience !== undefined) {
     const aud = options.audience
     if (typeof aud !== "string" && (!Array.isArray(aud) || aud.some((member) => typeof member !== "string"))) {
-      failSync("InvalidArgument", "\"aud\" claim must be a string or an array of strings")
+      throw new TypeError("\"aud\" claim must be a string or an array of strings")
     }
     payload.aud = aud
   }
@@ -216,13 +321,13 @@ export const buildClaims = (claims: Claims, options: IssueOptions, now: number):
   for (const claim of ["iat", "nbf", "exp"]) {
     const value = payload[claim]
     if (typeof value === "number" && !Number.isFinite(value)) {
-      failSync("InvalidArgument", `"${claim}" claim must be a finite number`)
+      throw new TypeError(`"${claim}" claim must be a finite number`)
     }
   }
   return new TextEncoder().encode(JSON.stringify(payload))
 }
 
-const rejectUnencoded = () => failSync("JwtInvalid", "JWTs MUST NOT use unencoded payload")
+const rejectUnencoded = () => raise(malformed("JWTs MUST NOT use unencoded payload"))
 
 /**
  * Issues a JWT signed with JWS compact serialization.
@@ -258,10 +363,10 @@ const rejectUnencoded = () => failSync("JwtInvalid", "JWTs MUST NOT use unencode
 export const sign = (
   claims: Claims,
   options: SignOptions
-): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+): Effect.Effect<string, SignError, Crypto.Crypto> =>
   Effect.flatMap(Clock.currentTimeMillis, (now) =>
     Effect.flatMap(
-      attempt(() => buildClaims(claims, options, now)),
+      attemptWith<never>()(() => buildClaims(claims, options, now)),
       (payload) =>
         JsonWebSignature.signCompact(
           payload,
@@ -273,7 +378,7 @@ export const sign = (
 const durationSeconds = (label: string, input: Duration.Input): number => {
   const duration = Duration.fromInput(input)
   if (duration._tag === "None" || !Duration.isFinite(duration.value)) {
-    return failSync("InvalidArgument", `Invalid ${label} input`)
+    throw new TypeError(`Invalid ${label} input`)
   }
   return Duration.toSeconds(duration.value)
 }
@@ -283,8 +388,10 @@ const normalizeTyp = (value: string) => {
   return value.includes("/") ? normalized : `application/${normalized}`
 }
 
-const claimError = (message: string, claim: string, check: "missing" | "invalid" | "check_failed", expired = false) =>
-  new JoseError({ reason: expired ? "Expired" : "ClaimValidationFailed", message, claim, check })
+const claimError = (message: string, claim: string, check: ClaimCheck, expired = false) =>
+  expired
+    ? new TokenExpiredError({ message, claim: claim as "exp" | "iat" })
+    : new ClaimValidationError({ message, claim, check })
 
 const validateNumericDate = (payload: Record<string, unknown>, claim: string, required = false) => {
   const value = payload[claim]
@@ -310,7 +417,7 @@ export const validateClaims = (
   } catch {
     // reported below
   }
-  if (!isObject(payload)) return failSync("JwtInvalid", "JWT Claims Set must be a top-level JSON object")
+  if (!isObject(payload)) return raise(malformed("JWT Claims Set must be a top-level JSON object"))
   const { typ } = options
   if (
     typ !== undefined &&
@@ -347,7 +454,7 @@ export const validateClaims = (
     ? 0
     : durationSeconds("clockTolerance option", options.clockTolerance)
   const now = epoch(options.currentDate === undefined ? nowMillis : options.currentDate.getTime())
-  if (!Number.isFinite(now)) failSync("InvalidArgument", "Invalid currentDate option input")
+  if (!Number.isFinite(now)) throw new TypeError("Invalid currentDate option input")
   const iat = validateNumericDate(payload, "iat", maxTokenAge !== undefined)
   const nbf = validateNumericDate(payload, "nbf")
   if (nbf !== undefined && nbf > now + tolerance) {
@@ -374,8 +481,7 @@ const decodeWith = <S extends Schema.Constraint>(schema: S) => (payload: Record<
   Effect.mapError(
     Schema.decodeUnknownEffect(schema)(payload),
     (cause) =>
-      new JoseError({
-        reason: "ClaimValidationFailed",
+      new ClaimValidationError({
         message: "JWT Claims Set does not match the schema",
         check: "invalid",
         cause
@@ -404,23 +510,23 @@ export const verify: {
     token: string | Uint8Array,
     key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
     options: VerifyOptions & { readonly schema: S }
-  ): Effect.Effect<Result<S["Type"]>, JoseError | E, Crypto.Crypto | R | S["DecodingServices"]>
+  ): Effect.Effect<Result<S["Type"]>, VerifyError | E, Crypto.Crypto | R | S["DecodingServices"]>
   <E = never, R = never>(
     token: string | Uint8Array,
     key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
     options?: VerifyOptions
-  ): Effect.Effect<Result<Claims>, JoseError | E, Crypto.Crypto | R>
+  ): Effect.Effect<Result<Claims>, VerifyError | E, Crypto.Crypto | R>
 } = <E, R>(
   token: string | Uint8Array,
   key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
   options?: VerifyOptions & { readonly schema?: Schema.Constraint }
-): Effect.Effect<Result<any>, JoseError | E, any> =>
+): Effect.Effect<Result<any>, VerifyError | E, any> =>
   Effect.gen(function*() {
     const verified = yield* JsonWebSignature.verifyCompactInternal(token, key, options)
-    if (!verified.b64) return yield* fail("JwtInvalid", "JWTs MUST NOT use unencoded payload")
+    if (!verified.b64) return yield* Effect.fail(malformed("JWTs MUST NOT use unencoded payload"))
     const now = yield* Clock.currentTimeMillis
     const protectedHeader = verified.protectedHeader as Record<string, unknown>
-    const claims = yield* attempt(() => validateClaims(protectedHeader, verified.payload, options ?? {}, now))
+    const claims = yield* attemptClaims(() => validateClaims(protectedHeader, verified.payload, options ?? {}, now))
     const payload = options?.schema === undefined ? claims : yield* decodeWith(options.schema)(claims)
     return { payload, protectedHeader }
   })
@@ -455,10 +561,10 @@ export interface EncryptOptions extends IssueOptions, Omit<JsonWebEncryption.Enc
 export const encrypt = (
   claims: Claims,
   options: EncryptOptions
-): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+): Effect.Effect<string, JsonWebEncryption.EncryptError, Crypto.Crypto> =>
   Effect.gen(function*() {
     const now = yield* Clock.currentTimeMillis
-    const bytes = yield* attempt(() => buildClaims(claims, options, now))
+    const bytes = yield* attemptWith<never>()(() => buildClaims(claims, options, now))
     const payload = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>
     const protectedHeader: Record<string, unknown> = { ...options.protectedHeader }
     if (options.replicateIssuerAsHeader) protectedHeader.iss = payload.iss
@@ -496,22 +602,22 @@ export const decrypt: {
     token: string | Uint8Array,
     key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
     options: DecryptOptions & { readonly schema: S }
-  ): Effect.Effect<Result<S["Type"]>, JoseError | E, Crypto.Crypto | R | S["DecodingServices"]>
+  ): Effect.Effect<Result<S["Type"]>, DecryptError | E, Crypto.Crypto | R | S["DecodingServices"]>
   <E = never, R = never>(
     token: string | Uint8Array,
     key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
     options?: DecryptOptions
-  ): Effect.Effect<Result<Claims>, JoseError | E, Crypto.Crypto | R>
+  ): Effect.Effect<Result<Claims>, DecryptError | E, Crypto.Crypto | R>
 } = <E, R>(
   token: string | Uint8Array,
   key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
   options?: DecryptOptions & { readonly schema?: Schema.Constraint }
-): Effect.Effect<Result<any>, JoseError | E, any> =>
+): Effect.Effect<Result<any>, DecryptError | E, any> =>
   Effect.gen(function*() {
     const decrypted = yield* JsonWebEncryption.decryptCompact(token, key, options)
     const now = yield* Clock.currentTimeMillis
     const protectedHeader = decrypted.protectedHeader as Record<string, unknown>
-    const claims = yield* attempt(() => {
+    const claims = yield* attemptClaims(() => {
       const payload = validateClaims(protectedHeader, decrypted.plaintext, options ?? {}, now)
       for (const claim of ["iss", "sub", "aud"] as const) {
         if (
@@ -539,16 +645,16 @@ export const decrypt: {
  * @category decoding
  * @since 4.0.0
  */
-export const decodeUnverified = (token: string): Effect.Effect<Claims, JoseError> =>
-  attempt(() => {
+export const decodeUnverified = (token: string): Effect.Effect<Claims, MalformedJwtError> =>
+  attemptWith<MalformedJwtError>()(() => {
     if (typeof token !== "string") {
-      return failSync("JwtInvalid", "JWTs must use Compact JWS serialization, JWT must be a string")
+      throw new TypeError("JWTs must use Compact JWS serialization, JWT must be a string")
     }
     const parts = token.split(".")
     if (parts.length === 5) {
-      return failSync("JwtInvalid", "Only JWTs using Compact JWS serialization can be decoded")
+      return raise(malformed("Only JWTs using Compact JWS serialization can be decoded"))
     }
-    if (parts.length !== 3) return failSync("JwtInvalid", "Invalid JWT")
-    if (!parts[1]) return failSync("JwtInvalid", "JWTs must contain a payload")
-    return parseHeader(parts[1], "JwtInvalid", "Invalid JWT Claims Set") as Claims
+    if (parts.length !== 3) return raise(malformed("Invalid JWT"))
+    if (!parts[1]) return raise(malformed("JWTs must contain a payload"))
+    return parseHeader(parts[1], malformed, "Invalid JWT Claims Set") as Claims
   })

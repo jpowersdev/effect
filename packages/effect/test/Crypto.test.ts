@@ -201,7 +201,10 @@ describe("Crypto", () => {
         assert.strictEqual((yield* webCrypto.exportKey("raw", key)).length, 32)
         const iv = new Uint8Array(12)
         const ciphertext = yield* webCrypto.encrypt({ name: "AES-GCM", iv }, key, new Uint8Array([9, 9]))
-        assert.deepStrictEqual(yield* webCrypto.decrypt({ name: "AES-GCM", iv }, key, ciphertext), new Uint8Array([9, 9]))
+        assert.deepStrictEqual(
+          yield* webCrypto.decrypt({ name: "AES-GCM", iv }, key, ciphertext),
+          new Uint8Array([9, 9])
+        )
         const tampered = ciphertext.slice()
         tampered[0] ^= 1
         const error = yield* Effect.flip(webCrypto.decrypt({ name: "AES-GCM", iv }, key, tampered))

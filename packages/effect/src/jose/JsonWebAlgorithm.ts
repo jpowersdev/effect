@@ -136,3 +136,43 @@ export const contentEncryptionAlgorithms = [
 export const ContentEncryptionAlgorithm: Schema.Literals<typeof contentEncryptionAlgorithms> = Schema.Literals(
   contentEncryptionAlgorithms
 )
+
+/**
+ * Error raised when an algorithm identifier is not supported, such as `none`,
+ * an unknown `alg` or `enc` value, or a key type or curve that no supported
+ * algorithm can use.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class UnsupportedAlgorithmError
+  extends Schema.TaggedError<UnsupportedAlgorithmError>("effect/jose/JsonWebAlgorithm/UnsupportedAlgorithmError")(
+    "UnsupportedAlgorithmError",
+    {
+      algorithm: Schema.optional(Schema.String),
+      message: Schema.String
+    }
+  )
+{}
+
+/**
+ * Error raised when a token's algorithm is supported but not in the caller's
+ * allow list (`algorithms`, `keyManagementAlgorithms`, or
+ * `contentEncryptionAlgorithms`), or is PBES2 without being allowed
+ * explicitly.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class AlgorithmNotAllowedError
+  extends Schema.TaggedError<AlgorithmNotAllowedError>("effect/jose/JsonWebAlgorithm/AlgorithmNotAllowedError")(
+    "AlgorithmNotAllowedError",
+    {
+      parameter: Schema.Literals(["alg", "enc"]),
+      algorithm: Schema.String,
+      message: Schema.String
+    }
+  )
+{}

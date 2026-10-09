@@ -9,12 +9,6 @@
  * @stability unstable
  * @since 4.0.0
  */
-export * as JoseError from "./JoseError.ts"
-
-/**
- * @stability unstable
- * @since 4.0.0
- */
 export * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
 
 /**

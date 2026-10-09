@@ -47,7 +47,7 @@ describe("JsonWebSignature", () => {
       const error = yield* Effect.flip(
         JsonWebSignature.verifyCompact(`${header}.aGVsbG8h.${signature}`, secret)
       )
-      assert.strictEqual(error.reason, "SignatureVerificationFailed")
+      assert.strictEqual(error._tag, "SignatureVerificationError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("enforces the algorithm allow list before using the key", () =>
@@ -55,15 +55,15 @@ describe("JsonWebSignature", () => {
       const secret = utf8("a-string-secret-at-least-256-bits-long")
       const jws = yield* JsonWebSignature.signCompact("hello", { key: secret, protectedHeader: { alg: "HS256" } })
       const error = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, secret, { algorithms: ["ES256"] }))
-      assert.strictEqual(error.reason, "AlgorithmNotAllowed")
-      assert.strictEqual(error.code, "ERR_JOSE_ALG_NOT_ALLOWED")
+      assert.strictEqual(error._tag, "AlgorithmNotAllowedError")
+      assert.strictEqual(error._tag === "AlgorithmNotAllowedError" && error.algorithm, "HS256")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("never accepts alg none", () =>
     Effect.gen(function*() {
       const token = "eyJhbGciOiJub25lIn0.aGVsbG8."
       const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, utf8("secret")))
-      assert.strictEqual(error.reason, "NotSupported")
+      assert.strictEqual(error._tag, "UnsupportedAlgorithmError")
     }).pipe(Effect.provide(CryptoLive)))
 
   it.effect("rejects keys that do not match the algorithm", () =>
@@ -72,9 +72,9 @@ describe("JsonWebSignature", () => {
       const jws = yield* JsonWebSignature.signCompact("hello", { key: privateKey, protectedHeader: { alg: "ES256" } })
       const p384 = yield* JsonWebKey.generateKeyPair("ES384")
       const curve = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, p384.publicKey))
-      assert.strictEqual(curve.reason, "InvalidKey")
+      assert.strictEqual(curve._tag, "InvalidKeyError")
       const secret = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, utf8("secret")))
-      assert.strictEqual(secret.reason, "InvalidKey")
+      assert.strictEqual(secret._tag, "InvalidKeyError")
       yield* JsonWebSignature.verifyCompact(jws, publicKey)
     }).pipe(Effect.provide(CryptoLive)))
 
@@ -93,7 +93,7 @@ describe("JsonWebSignature", () => {
         crit: { "urn:example": true }
       })
       const unknown = yield* Effect.flip(JsonWebSignature.verifyCompact(custom, secret))
-      assert.strictEqual(unknown.reason, "NotSupported")
+      assert.strictEqual(unknown._tag, "UnsupportedJwsHeaderError")
       yield* JsonWebSignature.verifyCompact(custom, secret, { crit: { "urn:example": true } })
     }).pipe(Effect.provide(CryptoLive)))
 

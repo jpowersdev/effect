@@ -12,29 +12,93 @@
  */
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import * as Schema from "../Schema.ts"
 import { jwsAlgorithm } from "./internal/algorithms.ts"
-import { checkModulusLength, prepareKey, rawKey } from "./internal/key.ts"
 import {
   ascii,
-  attempt,
+  attemptWith,
   b64u,
   concat,
   decodeB64u,
   encoder,
-  fail,
-  failSync,
   isDisjoint,
   isObject,
   JWS_RECOGNIZED,
-  mapCryptoError,
   parseHeader,
+  raise,
   serializeHeader,
   validateAlgorithms,
   validateB64,
   validateCrit
 } from "./internal/shared.ts"
-import type { JoseError } from "./JoseError.ts"
 import type * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
+import { AlgorithmNotAllowedError } from "./JsonWebAlgorithm.ts"
+import { checkModulusLength, type KeyError, prepareKey, rawKey } from "./JsonWebKey.ts"
+
+/**
+ * Error raised when a JWS is structurally invalid: the wrong number of
+ * segments, segments that are not base64url, a protected header that is not a
+ * JSON object, a missing `alg`, or an invalid `crit` or `b64` header.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class MalformedJwsError
+  extends Schema.TaggedError<MalformedJwsError>("effect/jose/JsonWebSignature/MalformedJwsError")(
+    "MalformedJwsError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Error raised when a JWS signature does not match its payload and key.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class SignatureVerificationError extends Schema.TaggedError<SignatureVerificationError>(
+  "effect/jose/JsonWebSignature/SignatureVerificationError"
+)("SignatureVerificationError", { message: Schema.String }) {}
+
+/**
+ * Error raised when a JWS lists a critical (`crit`) extension header
+ * parameter that the caller has not declared as understood.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class UnsupportedJwsHeaderError
+  extends Schema.TaggedError<UnsupportedJwsHeaderError>("effect/jose/JsonWebSignature/UnsupportedJwsHeaderError")(
+    "UnsupportedJwsHeaderError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Failures from producing a JWS.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type SignError = MalformedJwsError | UnsupportedJwsHeaderError | KeyError
+
+/**
+ * Failures from verifying a JWS.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export type VerifyError = SignError | AlgorithmNotAllowedError | SignatureVerificationError
+
+const malformed = (message: string) => new MalformedJwsError({ message })
+const unsupportedHeader = (message: string) => new UnsupportedJwsHeaderError({ message })
+const attemptSign = attemptWith<SignError>()
+const attempt = attemptWith<VerifyError>()
 
 /**
  * Header parameters of a JWS.
@@ -173,32 +237,33 @@ const createSignature = Effect.fnUntraced(function*(
   options: SignOptions,
   rejectUnencoded?: () => void
 ) {
-  const prepared = yield* attempt(() => {
+  const prepared = yield* attemptSign(() => {
     let protectedHeader: Record<string, unknown> | undefined
     let protectedString = ""
     if (options.protectedHeader !== undefined) {
-      const [parsed, serialized] = serializeHeader("JwsInvalid", options.protectedHeader)
+      const [parsed, serialized] = serializeHeader(malformed, options.protectedHeader)
       protectedHeader = parsed
       protectedString = b64u(serialized)
     }
     const unprotectedHeader = options.unprotectedHeader === undefined
       ? undefined
-      : serializeHeader("JwsInvalid", options.unprotectedHeader)[0]
+      : serializeHeader(malformed, options.unprotectedHeader)[0]
     if (!protectedHeader && !unprotectedHeader) {
-      failSync("JwsInvalid", "either a protected or an unprotected header must be provided")
+      raise(malformed("either a protected or an unprotected header must be provided"))
     }
     if (!isDisjoint(protectedHeader, unprotectedHeader)) {
-      failSync("JwsInvalid", "JWS Protected and JWS Unprotected Header Parameter names must be disjoint")
+      raise(malformed("JWS Protected and JWS Unprotected Header Parameter names must be disjoint"))
     }
     const joseHeader = { ...protectedHeader, ...unprotectedHeader }
     const b64 = validateB64(
+      malformed,
       protectedHeader ?? {},
-      validateCrit("JwsInvalid", JWS_RECOGNIZED, options.crit, protectedHeader, joseHeader)
+      validateCrit(malformed, unsupportedHeader, JWS_RECOGNIZED, options.crit, protectedHeader, joseHeader)
     )
     if (!b64) rejectUnencoded?.()
     const alg = joseHeader.alg
     if (typeof alg !== "string" || !alg) {
-      failSync("JwsInvalid", "JWS \"alg\" (Algorithm) Header Parameter missing or invalid")
+      raise(malformed("JWS \"alg\" (Algorithm) Header Parameter missing or invalid"))
     }
     const entry = jwsAlgorithm(alg)
     let payloadString = ""
@@ -213,9 +278,9 @@ const createSignature = Effect.fnUntraced(function*(
   })
   const { entry } = prepared
   const key = yield* rawKey(yield* prepareKey(entry, options.key, "sign"), entry.key!, "sign")
-  if (entry.minRsaBits) yield* attempt(() => checkModulusLength(entry.alg, key))
+  if (entry.minRsaBits) yield* attemptSign(() => checkModulusLength(entry.alg, key))
   const crypto = yield* cryptoService
-  const signature = yield* mapCryptoError(crypto.sign(entry.signing, key, prepared.data))
+  const signature = yield* crypto.sign(entry.signing, key, prepared.data)
   const jws: Signed["jws"] = { payload: prepared.payloadString, signature: b64u(signature) }
   if (prepared.protectedHeader) jws.protected = prepared.protectedString
   if (prepared.unprotectedHeader) jws.header = prepared.unprotectedHeader as Header
@@ -256,12 +321,14 @@ export const signCompact = (
   payload: Uint8Array | string,
   options: Omit<SignOptions, "unprotectedHeader"> & { readonly protectedHeader: Header },
   rejectUnencoded?: () => void
-): Effect.Effect<string, JoseError, Crypto.Crypto> =>
+): Effect.Effect<string, SignError, Crypto.Crypto> =>
   Effect.flatMap(createSignature(toBytes(payload), options, rejectUnencoded), ({ b64, jws }) => {
     if (!b64) {
       const raw = typeof payload === "string" ? payload : new TextDecoder().decode(payload)
       if (ascii(raw) === undefined || raw.includes(".")) {
-        return fail("JwsInvalid", "JWS Compact Serialization payload must use only ASCII characters other than \".\"")
+        return Effect.fail(
+          malformed("JWS Compact Serialization payload must use only ASCII characters other than \".\"")
+        )
       }
       return Effect.succeed(`${jws.protected}.${raw}.${jws.signature}`)
     }
@@ -278,7 +345,7 @@ export const signCompact = (
 export const signFlattened = (
   payload: Uint8Array | string,
   options: SignOptions
-): Effect.Effect<Flattened, JoseError, Crypto.Crypto> =>
+): Effect.Effect<Flattened, SignError, Crypto.Crypto> =>
   Effect.map(
     createSignature(toBytes(payload), options),
     ({ b64, jws, payloadBytes }) => b64 ? jws : { ...jws, payload: new TextDecoder().decode(payloadBytes) }
@@ -298,8 +365,8 @@ export const signFlattened = (
 export const signGeneral = Effect.fnUntraced(function*(
   payload: Uint8Array | string,
   signers: ReadonlyArray<SignOptions>
-): Effect.fn.Return<General, JoseError, Crypto.Crypto> {
-  if (signers.length === 0) return yield* fail("JwsInvalid", "at least one signature must be added")
+): Effect.fn.Return<General, SignError, Crypto.Crypto> {
+  if (signers.length === 0) return yield* Effect.fail(malformed("at least one signature must be added"))
   const bytes = toBytes(payload)
   const signatures: Array<Omit<Flattened, "payload">> = []
   let b64: boolean | undefined
@@ -310,7 +377,7 @@ export const signGeneral = Effect.fnUntraced(function*(
       b64 = signed.b64
       encoded = signed.b64 ? signed.jws.payload : new TextDecoder().decode(bytes)
     } else if (b64 !== signed.b64) {
-      return yield* fail("JwsInvalid", "inconsistent use of JWS Unencoded Payload (RFC7797)")
+      return yield* Effect.fail(malformed("inconsistent use of JWS Unencoded Payload (RFC7797)"))
     }
     const { payload: _, ...rest } = signed.jws
     signatures.push(rest)
@@ -321,18 +388,17 @@ export const signGeneral = Effect.fnUntraced(function*(
 const encodeJsonUnencodedPayload = (payload: string): Uint8Array => {
   const invalid = /[\p{Cs}\p{Cn}]/u.exec(payload)?.[0]
   if (invalid !== undefined) {
-    failSync(
-      "JwsInvalid",
+    raise(malformed(
       /\p{Cs}/u.test(invalid)
         ? "JWS Payload must be a well-formed Unicode string"
         : "JWS Payload must not contain unassigned Unicode code points"
-    )
+    ))
   }
   return encoder.encode(payload)
 }
 
 const encodeCompactUnencodedPayload = (payload: string): Uint8Array =>
-  ascii(payload) ?? failSync("JwsInvalid", "JWS Compact Serialization payload must use only ASCII characters")
+  ascii(payload) ?? raise(malformed("JWS Compact Serialization payload must use only ASCII characters"))
 
 const snapshot = (jws: Record<string, unknown>): Flattened => {
   const encodedProtected = jws.protected
@@ -340,14 +406,14 @@ const snapshot = (jws: Record<string, unknown>): Flattened => {
   const payload = jws.payload
   const signature = jws.signature
   if (encodedProtected === undefined && header === undefined) {
-    failSync("JwsInvalid", "Flattened JWS must have either of the \"protected\" or \"header\" members")
+    raise(malformed("Flattened JWS must have either of the \"protected\" or \"header\" members"))
   }
   if (encodedProtected !== undefined && typeof encodedProtected !== "string") {
-    failSync("JwsInvalid", "JWS Protected Header incorrect type")
+    raise(malformed("JWS Protected Header incorrect type"))
   }
-  if (payload === undefined) failSync("JwsInvalid", "JWS Payload missing")
-  if (typeof signature !== "string") failSync("JwsInvalid", "JWS Signature missing or incorrect type")
-  if (header !== undefined && !isObject(header)) failSync("JwsInvalid", "JWS Unprotected Header incorrect type")
+  if (payload === undefined) raise(malformed("JWS Payload missing"))
+  if (typeof signature !== "string") raise(malformed("JWS Signature missing or incorrect type"))
+  if (header !== undefined && !isObject(header)) raise(malformed("JWS Unprotected Header incorrect type"))
   const out: Record<string, unknown> = {
     payload: payload instanceof Uint8Array ? new Uint8Array(payload) : payload,
     signature
@@ -363,34 +429,41 @@ const verifySignature = <E, R>(
   key: Key | KeyResolver<E, R>,
   encodeUnencoded: (payload: string) => Uint8Array,
   parsedProtected?: Record<string, unknown>
-): Effect.Effect<VerifyResult & { readonly b64: boolean }, JoseError | E, Crypto.Crypto | R> =>
+): Effect.Effect<VerifyResult & { readonly b64: boolean }, VerifyError | E, Crypto.Crypto | R> =>
   Effect.gen(function*() {
     const checked = yield* attempt(() => {
       const algorithms = validateAlgorithms("algorithms", options?.algorithms)
       const protectedHeader = parsedProtected ??
         (jws.protected === undefined
           ? {}
-          : parseHeader(jws.protected, "JwsInvalid", "JWS Protected Header is invalid"))
+          : parseHeader(jws.protected, malformed, "JWS Protected Header is invalid"))
       if (!isDisjoint(protectedHeader, jws.header)) {
-        failSync("JwsInvalid", "JWS Protected and JWS Unprotected Header Parameter names must be disjoint")
+        raise(malformed("JWS Protected and JWS Unprotected Header Parameter names must be disjoint"))
       }
       const joseHeader: Record<string, unknown> = { ...protectedHeader, ...jws.header }
       const b64 = validateB64(
+        malformed,
         protectedHeader,
-        validateCrit("JwsInvalid", JWS_RECOGNIZED, options?.crit, protectedHeader, joseHeader)
+        validateCrit(malformed, unsupportedHeader, JWS_RECOGNIZED, options?.crit, protectedHeader, joseHeader)
       )
       const alg = joseHeader.alg
       if (typeof alg !== "string" || !alg) {
-        failSync("JwsInvalid", "JWS \"alg\" (Algorithm) Header Parameter missing or invalid")
+        raise(malformed("JWS \"alg\" (Algorithm) Header Parameter missing or invalid"))
       }
       if (algorithms && !algorithms.has(alg as string)) {
-        failSync("AlgorithmNotAllowed", "\"alg\" (Algorithm) Header Parameter value not allowed")
+        raise(
+          new AlgorithmNotAllowedError({
+            parameter: "alg",
+            algorithm: alg as string,
+            message: "\"alg\" (Algorithm) Header Parameter value not allowed"
+          })
+        )
       }
       const input = jws.payload
       if (b64) {
-        if (typeof input !== "string") failSync("JwsInvalid", "JWS Payload must be a string")
+        if (typeof input !== "string") raise(malformed("JWS Payload must be a string"))
       } else if (typeof input !== "string" && !(input instanceof Uint8Array)) {
-        failSync("JwsInvalid", "JWS Payload must be a string or an Uint8Array instance")
+        raise(malformed("JWS Payload must be a string or an Uint8Array instance"))
       }
       const signingPayload: string | Uint8Array = b64 || typeof input !== "string" ? input : encodeUnencoded(input)
       return { protectedHeader, b64, alg: alg as string, signingPayload }
@@ -404,14 +477,14 @@ const verifySignature = <E, R>(
     const prepared = yield* attempt(() => {
       const entry = jwsAlgorithm(checked.alg)
       const payloadPart = typeof checked.signingPayload === "string"
-        ? ascii(checked.signingPayload) ?? failSync("JwsInvalid", "The payload is not a valid base64url string")
+        ? ascii(checked.signingPayload) ?? raise(malformed("The payload is not a valid base64url string"))
         : checked.signingPayload
       const data = concat(
         jws.protected !== undefined ? ascii(jws.protected) ?? new Uint8Array() : new Uint8Array(),
         Uint8Array.of(0x2e),
         payloadPart
       )
-      const signature = decodeB64u(jws.signature, "signature", "JwsInvalid")
+      const signature = decodeB64u(jws.signature, "signature", malformed)
       return { entry, data, signature }
     })
     const { entry } = prepared
@@ -422,9 +495,11 @@ const verifySignature = <E, R>(
       crypto.verify(entry.signing, k, prepared.signature, prepared.data),
       () => false
     )
-    if (!verified) return yield* fail("SignatureVerificationFailed", "signature verification failed")
+    if (!verified) {
+      return yield* Effect.fail(new SignatureVerificationError({ message: "signature verification failed" }))
+    }
     const payload = typeof checked.signingPayload === "string"
-      ? yield* attempt(() => decodeB64u(checked.signingPayload as string, "payload", "JwsInvalid"))
+      ? yield* attempt(() => decodeB64u(checked.signingPayload as string, "payload", malformed))
       : checked.signingPayload
     const result: { payload: Uint8Array; protectedHeader?: Header; unprotectedHeader?: Header; b64: boolean } = {
       payload,
@@ -440,12 +515,12 @@ export const verifyCompactInternal = <E, R>(
   jws: string | Uint8Array,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
-): Effect.Effect<VerifyResult & { readonly b64: boolean }, JoseError | E, Crypto.Crypto | R> =>
+): Effect.Effect<VerifyResult & { readonly b64: boolean }, VerifyError | E, Crypto.Crypto | R> =>
   Effect.suspend(() => {
     const input = jws instanceof Uint8Array ? new TextDecoder().decode(jws) : jws
-    if (typeof input !== "string") return fail("JwsInvalid", "Compact JWS must be a string or Uint8Array")
+    if (typeof input !== "string") return Effect.fail(malformed("Compact JWS must be a string or Uint8Array"))
     const parts = input.split(".")
-    if (parts.length !== 3) return fail("JwsInvalid", "Invalid Compact JWS")
+    if (parts.length !== 3) return Effect.fail(malformed("Invalid Compact JWS"))
     return verifySignature(
       { protected: parts[0], payload: parts[1], signature: parts[2] },
       options,
@@ -470,7 +545,7 @@ export const verifyCompact = <E = never, R = never>(
   jws: string | Uint8Array,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
-): Effect.Effect<VerifyResult, JoseError | E, Crypto.Crypto | R> =>
+): Effect.Effect<VerifyResult, VerifyError | E, Crypto.Crypto | R> =>
   Effect.map(verifyCompactInternal(jws, key, options), ({ b64: _, ...result }) => result)
 
 /**
@@ -484,9 +559,9 @@ export const verifyFlattened = <E = never, R = never>(
   jws: Flattened,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
-): Effect.Effect<VerifyResult, JoseError | E, Crypto.Crypto | R> =>
+): Effect.Effect<VerifyResult, VerifyError | E, Crypto.Crypto | R> =>
   Effect.suspend(() => {
-    if (!isObject(jws)) return fail("JwsInvalid", "Flattened JWS must be an object")
+    if (!isObject(jws)) return Effect.fail(malformed("Flattened JWS must be an object"))
     return Effect.flatMap(
       attempt(() => snapshot(jws)),
       (snap) =>
@@ -509,21 +584,23 @@ export const verifyGeneral = <E = never, R = never>(
   jws: General,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
-): Effect.Effect<VerifyResult, JoseError | E, Crypto.Crypto | R> =>
+): Effect.Effect<VerifyResult, VerifyError | E, Crypto.Crypto | R> =>
   Effect.gen(function*() {
-    if (!isObject(jws)) return yield* fail("JwsInvalid", "General JWS must be an object")
+    if (!isObject(jws)) return yield* Effect.fail(malformed("General JWS must be an object"))
     const { signatures, payload } = jws as unknown as Record<string, unknown>
     if (!Array.isArray(signatures) || !signatures.every(isObject)) {
-      return yield* fail("JwsInvalid", "JWS Signatures missing or incorrect type")
+      return yield* Effect.fail(malformed("JWS Signatures missing or incorrect type"))
     }
-    if (payload === undefined) return yield* fail("SignatureVerificationFailed", "signature verification failed")
+    if (payload === undefined) {
+      return yield* Effect.fail(new SignatureVerificationError({ message: "signature verification failed" }))
+    }
     const candidates: Array<readonly [Flattened, Record<string, unknown>, number]> = []
     for (const signature of signatures) {
       try {
         const snap = snapshot({ ...signature, payload })
         const protectedHeader = snap.protected === undefined
           ? {}
-          : parseHeader(snap.protected, "JwsInvalid", "JWS Protected Header is invalid")
+          : parseHeader(snap.protected, malformed, "JWS Protected Header is invalid")
         const { b64, crit } = protectedHeader
         const mode = Array.isArray(crit) && crit.includes("b64")
           ? typeof b64 === "boolean" ? (b64 ? 1 : 2) : 0
@@ -536,7 +613,7 @@ export const verifyGeneral = <E = never, R = never>(
     let modes = 0
     for (const [, , mode] of candidates) {
       modes |= mode
-      if (modes === 3) return yield* fail("JwsInvalid", "inconsistent use of JWS Unencoded Payload (RFC7797)")
+      if (modes === 3) return yield* Effect.fail(malformed("inconsistent use of JWS Unencoded Payload (RFC7797)"))
     }
     for (const [snap, protectedHeader] of candidates) {
       const result = yield* Effect.result(
@@ -547,7 +624,7 @@ export const verifyGeneral = <E = never, R = never>(
         return rest
       }
     }
-    return yield* fail("SignatureVerificationFailed", "signature verification failed")
+    return yield* Effect.fail(new SignatureVerificationError({ message: "signature verification failed" }))
   })
 
 /**
@@ -561,9 +638,9 @@ export const verifyGeneral = <E = never, R = never>(
  * @category decoding
  * @since 4.0.0
  */
-export const decodeProtectedHeader = (token: string): Effect.Effect<Header, JoseError> =>
-  attempt(() => {
-    if (typeof token !== "string") return failSync("InvalidArgument", "Token must be a string")
+export const decodeProtectedHeader = (token: string): Effect.Effect<Header, MalformedJwsError> =>
+  attemptWith<MalformedJwsError>()(() => {
+    if (typeof token !== "string") throw new TypeError("Token must be a string")
     const encoded = token.split(".")[0]
-    return parseHeader(encoded, "InvalidArgument", "Invalid Token or Protected Header formatting") as Header
+    return parseHeader(encoded, malformed, "Invalid Token or Protected Header formatting") as Header
   })
