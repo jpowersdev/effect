@@ -5,6 +5,7 @@ import * as HttpClientResponse from "effect/http/HttpClientResponse"
 import { JsonWebKey, JsonWebKeySet, JsonWebSignature } from "effect/jose"
 import * as Layer from "effect/Layer"
 import * as KeyValueStore from "effect/persistence/KeyValueStore"
+import * as Redacted from "effect/Redacted"
 import * as TestClock from "effect/testing/TestClock"
 import { CryptoLive } from "./utils.ts"
 
@@ -110,8 +111,8 @@ describe("JsonWebSignature.embeddedKey", () => {
     Effect.gen(function*() {
       const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
       const jwk = yield* JsonWebKey.exportJwk(publicKey)
-      const privateJwk = yield* JsonWebKey.exportJwk(privateKey)
-      const cases = [
+      const privateJwk = Redacted.value(yield* JsonWebKey.exportPrivateJwk(privateKey))
+      const cases: ReadonlyArray<Omit<JsonWebSignature.SignOptions, "key">> = [
         { protectedHeader: { alg: "ES256" } },
         { protectedHeader: { alg: "ES256" }, unprotectedHeader: { jwk } },
         { protectedHeader: { alg: "ES256", jwk: privateJwk } }

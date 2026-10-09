@@ -176,3 +176,12 @@ export class AlgorithmNotAllowedError
     }
   )
 {}
+
+/**
+ * Any supported JOSE algorithm identifier.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Algorithm = SignatureAlgorithm | KeyManagementAlgorithm | ContentEncryptionAlgorithm

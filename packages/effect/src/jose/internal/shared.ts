@@ -1,6 +1,9 @@
 import type * as Crypto from "../../Crypto.ts"
 import * as Effect from "../../Effect.ts"
+import * as Base64Url from "../../encoding/Base64Url.ts"
 import type * as PlatformError from "../../PlatformError.ts"
+import * as Redacted from "../../Redacted.ts"
+import * as Result from "../../Result.ts"
 
 /** @internal */
 export const encoder = new TextEncoder()
@@ -97,65 +100,26 @@ export const ascii = (input: string): Uint8Array | undefined => {
   return out
 }
 
-const B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-const B64_LOOKUP = (() => {
-  const table = new Int16Array(128).fill(-1)
-  for (let i = 0; i < B64_ALPHABET.length; i++) table[B64_ALPHABET.charCodeAt(i)] = i
-  return table
-})()
-
 /**
  * Encodes bytes or UTF-8 text as unpadded base64url.
  *
  * @internal
  */
-export const b64u = (input: Uint8Array | string): string => {
-  const bytes = typeof input === "string" ? encoder.encode(input) : input
-  let out = ""
-  let i = 0
-  for (; i + 2 < bytes.length; i += 3) {
-    const n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2]
-    out += B64_ALPHABET[n >> 18] + B64_ALPHABET[(n >> 12) & 63] + B64_ALPHABET[(n >> 6) & 63] + B64_ALPHABET[n & 63]
-  }
-  const rest = bytes.length - i
-  if (rest === 1) {
-    const n = bytes[i] << 16
-    out += B64_ALPHABET[n >> 18] + B64_ALPHABET[(n >> 12) & 63]
-  } else if (rest === 2) {
-    const n = (bytes[i] << 16) | (bytes[i + 1] << 8)
-    out += B64_ALPHABET[n >> 18] + B64_ALPHABET[(n >> 12) & 63] + B64_ALPHABET[(n >> 6) & 63]
-  }
-  return out
-}
+export const b64u = (input: Uint8Array | string): string => Base64Url.encode(input)
+
+const UNPADDED_BASE64URL = /^[A-Za-z0-9_-]*$/
 
 /**
- * Decodes strict unpadded base64url, returning `undefined` for any character
- * outside the base64url alphabet, padding, whitespace, or an impossible
- * length.
+ * Decodes base64url as JOSE requires (RFC 7515 section 2): no padding,
+ * whitespace, or characters outside the base64url alphabet. Returns
+ * `undefined` for invalid input.
  *
  * @internal
  */
 export const b64uDecode = (input: string): Uint8Array | undefined => {
-  const length = input.length
-  if (length % 4 === 1) return undefined
-  const out = new Uint8Array(Math.floor((length * 3) / 4))
-  let buffer = 0
-  let bits = 0
-  let offset = 0
-  for (let i = 0; i < length; i++) {
-    const code = input.charCodeAt(i)
-    const value = code < 128 ? B64_LOOKUP[code] : -1
-    if (value === -1) return undefined
-    buffer = (buffer << 6) | value
-    bits += 6
-    if (bits >= 8) {
-      bits -= 8
-      out[offset++] = (buffer >> bits) & 0xff
-    }
-  }
-  // Non-canonical encodings carry non-zero trailing bits.
-  if ((buffer & ((1 << bits) - 1)) !== 0) return undefined
-  return out
+  if (input.length % 4 === 1 || !UNPADDED_BASE64URL.test(input)) return undefined
+  const decoded = Base64Url.decode(input)
+  return Result.isSuccess(decoded) ? decoded.success : undefined
 }
 
 /** @internal */
@@ -321,3 +285,35 @@ export const timingSafeEqual = (a: Uint8Array, b: Uint8Array): boolean => {
 export const isCryptoKey = (u: unknown): u is Crypto.Key =>
   typeof u === "object" && u !== null && !(u instanceof Uint8Array) &&
   "usages" in u && "algorithm" in u && "type" in u && "extractable" in u && !isObject(u)
+
+/**
+ * Default upper bound on the length of a compact token, in characters.
+ *
+ * @internal
+ */
+export const DEFAULT_MAX_TOKEN_LENGTH = 65_536
+
+/**
+ * Reads a token given as a string, bytes, or a `Redacted` string. Returns
+ * `undefined` for anything else.
+ *
+ * @internal
+ */
+export const readToken = (input: unknown): string | undefined => {
+  const value = Redacted.isRedacted(input) ? Redacted.value(input) : input
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value)
+  return typeof value === "string" ? value : undefined
+}
+
+/**
+ * Validates a maximum length option, returning the default when omitted.
+ *
+ * @internal
+ */
+export const maxTokenLength = (value: number | undefined): number => {
+  if (value === undefined) return DEFAULT_MAX_TOKEN_LENGTH
+  if (value !== Infinity && (!Number.isSafeInteger(value) || value < 1)) {
+    throw new TypeError("maxTokenLength must be a positive safe integer or Infinity")
+  }
+  return value
+}

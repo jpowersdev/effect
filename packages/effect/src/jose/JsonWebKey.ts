@@ -19,6 +19,7 @@ import * as Exit from "../Exit.ts"
 import * as Hash from "../Hash.ts"
 import * as Layer from "../Layer.ts"
 import type * as PlatformError from "../PlatformError.ts"
+import * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
 import { ENC, JWE, JWS, type Usage } from "./internal/algorithms.ts"
 import {
@@ -31,6 +32,7 @@ import {
   mapPlatformError,
   raise
 } from "./internal/shared.ts"
+import type * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
 import { UnsupportedAlgorithmError } from "./JsonWebAlgorithm.ts"
 
 /**
@@ -375,11 +377,12 @@ export const layerKeyCache = (options: KeyCacheOptions): Layer.Layer<never> =>
  */
 export const prepareKey = (
   entry: KeyEntry,
-  key: unknown,
+  input: unknown,
   usage: Usage
 ): Effect.Effect<Crypto.Key | Uint8Array, KeyError, Crypto.Crypto> =>
   Effect.suspend(() => {
     const isPrivate = usage === "decrypt" || usage === "sign"
+    const key = Redacted.isRedacted(input) ? Redacted.value(input) : input
     if (entry.secret && key instanceof Uint8Array) return Effect.succeed(key)
     if (isObject(key)) {
       return attempt(() => {
@@ -519,6 +522,18 @@ export const unsupportedByRuntime = (
 }
 
 /**
+ * Enforces RFC 7518 section 3.2: an HMAC key must be at least as long as the
+ * hash output (32 bytes for HS256, 48 for HS384, 64 for HS512).
+ */
+const checkHmacLength = (key: Crypto.Key | Uint8Array, hash: Crypto.DigestAlgorithm) => {
+  const minimum = Number.parseInt(hash.slice(-3), 10)
+  const bits = key instanceof Uint8Array ? key.length * 8 : key.algorithm.length
+  if (bits === undefined || bits < minimum) {
+    raise(invalidKey(`HMAC with ${hash} requires a key of at least ${minimum} bits`))
+  }
+}
+
+/**
  * Imports raw secret bytes for `expected`, or checks that an existing key is
  * bound to `expected` and permits `usage`.
  *
@@ -531,6 +546,7 @@ export const rawKey = (
   extractable = false
 ): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
+    if (expected.name === "HMAC") yield* attempt(() => checkHmacLength(key, expected.hash))
     let k: Crypto.Key
     if (key instanceof Uint8Array) {
       const crypto = yield* Crypto.Crypto
@@ -579,11 +595,12 @@ const entryFor = (alg: unknown): KeyEntry => {
  * @since 4.0.0
  */
 export const importJwk = (
-  jwk: Jwk,
-  alg?: string,
+  input: Jwk | Redacted.Redacted<Jwk>,
+  alg?: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ): Effect.Effect<Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
+    const jwk = Redacted.isRedacted(input) ? Redacted.value(input) : input
     if (!isObject(jwk)) return yield* Effect.die(new TypeError("JWK must be an object"))
     const normalized = yield* attempt(() => normalizeJwk(jwk))
     const algorithm = alg ?? normalized.alg
@@ -658,11 +675,12 @@ const algorithmForDer = (entry: KeyEntry, der: Uint8Array): Crypto.KeyAlgorithm 
 
 const importDer = (format: "spki" | "pkcs8", label: string) =>
 (
-  pem: string,
-  alg: string,
+  input: string | Redacted.Redacted<string>,
+  alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ): Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
+    const pem = Redacted.isRedacted(input) ? Redacted.value(input) : input
     if (typeof pem !== "string") return yield* Effect.die(new TypeError(`"${format}" must be a string`))
     const { entry, der, algorithm } = yield* attempt(() => {
       const entry = entryFor(alg)
@@ -689,7 +707,7 @@ const importDer = (format: "spki" | "pkcs8", label: string) =>
  */
 export const importSpki: (
   pem: string,
-  alg: string,
+  alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ) => Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> = importDer("spki", "PUBLIC KEY")
 
@@ -701,19 +719,12 @@ export const importSpki: (
  * @since 4.0.0
  */
 export const importPkcs8: (
-  pem: string,
-  alg: string,
+  pem: string | Redacted.Redacted<string>,
+  alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ) => Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> = importDer("pkcs8", "PRIVATE KEY")
 
-/**
- * Exports a key or raw secret as a JSON Web Key.
- *
- * @stability unstable
- * @category exporting
- * @since 4.0.0
- */
-export const exportJwk = (key: Key): Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
+const exportAnyJwk = (key: Key): Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   Effect.gen(function*() {
     if (key instanceof Uint8Array) return { kty: "oct", k: b64u(key) }
     if (!isCryptoKey(key)) return yield* Effect.die(new TypeError("Key must be a Crypto.Key or Uint8Array"))
@@ -722,6 +733,92 @@ export const exportJwk = (key: Key): Effect.Effect<Jwk, InvalidKeyError | Platfo
     const { ext: _ext, key_ops: _ops, alg: _alg, use: _use, ...jwk } = yield* crypto.exportKey("jwk", key)
     return jwk as Jwk
   })
+
+/**
+ * Exports a public key as a JSON Web Key.
+ *
+ * **When to use**
+ *
+ * Use to publish a public key, for example in a key set.
+ *
+ * **Gotchas**
+ *
+ * Private keys and secrets fail with {@link InvalidKeyError}; export them with
+ * {@link exportPrivateJwk}, which keeps the result `Redacted`.
+ *
+ * @see {@link exportPrivateJwk} for private keys and secrets
+ *
+ * @stability unstable
+ * @category exporting
+ * @since 4.0.0
+ */
+export const exportJwk = (
+  key: Crypto.Key
+): Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
+  isCryptoKey(key) && key.type !== "public"
+    ? Effect.fail(invalidKey("exportJwk only exports public keys; use exportPrivateJwk"))
+    : exportAnyJwk(key)
+
+/**
+ * Exports an extractable private key, or a secret, as a `Redacted` JSON Web
+ * Key so the key material does not leak into logs.
+ *
+ * @see {@link exportJwk} for public keys
+ *
+ * @stability unstable
+ * @category exporting
+ * @since 4.0.0
+ */
+export const exportPrivateJwk = (
+  key: Key
+): Effect.Effect<Redacted.Redacted<Jwk>, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
+  isCryptoKey(key) && key.type === "public"
+    ? Effect.fail(invalidKey("exportPrivateJwk only exports private keys and secrets; use exportJwk"))
+    : Effect.map(exportAnyJwk(key), (jwk) => Redacted.make(jwk))
+
+/**
+ * Schema for a PEM-encoded SPKI public key.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const SpkiPem = Schema.String.check(
+  Schema.isPattern(/^-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+\n-----END PUBLIC KEY-----$/, {
+    expected: "a PEM-encoded SPKI public key"
+  })
+).pipe(Schema.brand("~effect/jose/JsonWebKey/SpkiPem"))
+
+/**
+ * A PEM-encoded SPKI public key.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type SpkiPem = typeof SpkiPem.Type
+
+/**
+ * Schema for a PEM-encoded PKCS #8 private key.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Pkcs8Pem = Schema.String.check(
+  Schema.isPattern(/^-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+\n-----END PRIVATE KEY-----$/, {
+    expected: "a PEM-encoded PKCS #8 private key"
+  })
+).pipe(Schema.brand("~effect/jose/JsonWebKey/Pkcs8Pem"))
+
+/**
+ * A PEM-encoded PKCS #8 private key.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Pkcs8Pem = typeof Pkcs8Pem.Type
 
 const exportDer =
   (format: "spki" | "pkcs8", label: string, type: Crypto.Key["type"]) =>
@@ -741,28 +838,27 @@ const exportDer =
  * @category exporting
  * @since 4.0.0
  */
-export const exportSpki: (
+export const exportSpki = (
   key: Crypto.Key
-) => Effect.Effect<string, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> = exportDer(
-  "spki",
-  "PUBLIC KEY",
-  "public"
-)
+): Effect.Effect<SpkiPem, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
+  exportDer("spki", "PUBLIC KEY", "public")(key) as Effect.Effect<
+    SpkiPem,
+    InvalidKeyError | PlatformError.PlatformError,
+    Crypto.Crypto
+  >
 
 /**
- * Exports an extractable private key as a PEM-encoded PKCS #8 string.
+ * Exports an extractable private key as a `Redacted` PEM-encoded PKCS #8
+ * string.
  *
  * @stability unstable
  * @category exporting
  * @since 4.0.0
  */
-export const exportPkcs8: (
+export const exportPkcs8 = (
   key: Crypto.Key
-) => Effect.Effect<string, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> = exportDer(
-  "pkcs8",
-  "PRIVATE KEY",
-  "private"
-)
+): Effect.Effect<Redacted.Redacted<Pkcs8Pem>, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
+  Effect.map(exportDer("pkcs8", "PRIVATE KEY", "private")(key), (pem) => Redacted.make(pem as Pkcs8Pem))
 
 /**
  * Options for asymmetric key pair generation.
@@ -794,7 +890,7 @@ export interface GenerateKeyPairOptions {
  * @since 4.0.0
  */
 export const generateKeyPair = (
-  alg: string,
+  alg: JsonWebAlgorithm.Algorithm,
   options?: GenerateKeyPairOptions
 ): Effect.Effect<Crypto.KeyPair, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
@@ -834,7 +930,7 @@ export const generateKeyPair = (
  * @since 4.0.0
  */
 export const generateSecret = (
-  alg: string,
+  alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ): Effect.Effect<Key, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
@@ -868,6 +964,48 @@ const required = (jwk: Record<string, unknown>, name: string, description: strin
 }
 
 /**
+ * Schema for an RFC 7638 JWK thumbprint: unpadded base64url text.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Thumbprint = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]+$/, { expected: "a base64url JWK thumbprint" })
+).pipe(Schema.brand("~effect/jose/JsonWebKey/Thumbprint"))
+
+/**
+ * An RFC 7638 JWK thumbprint.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Thumbprint = typeof Thumbprint.Type
+
+/**
+ * Schema for an RFC 9278 JWK thumbprint URI.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const ThumbprintUri = Schema.String.check(
+  Schema.isPattern(/^urn:ietf:params:oauth:jwk-thumbprint:sha-(256|384|512):[A-Za-z0-9_-]+$/, {
+    expected: "a JWK thumbprint URI"
+  })
+).pipe(Schema.brand("~effect/jose/JsonWebKey/ThumbprintUri"))
+
+/**
+ * An RFC 9278 JWK thumbprint URI.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type ThumbprintUri = typeof ThumbprintUri.Type
+
+/**
  * Digest algorithms for JWK thumbprints.
  *
  * @stability unstable
@@ -889,11 +1027,12 @@ export type ThumbprintDigest = "sha256" | "sha384" | "sha512"
  * @since 4.0.0
  */
 export const thumbprint = (
-  key: Jwk | Key,
+  key: Jwk | Key | Redacted.Redacted<Jwk>,
   digest: ThumbprintDigest = "sha256"
-): Effect.Effect<string, KeyError, Crypto.Crypto> =>
+): Effect.Effect<Thumbprint, KeyError, Crypto.Crypto> =>
   Effect.gen(function*() {
-    const jwk: Record<string, unknown> = isObject(key) ? { ...key } : yield* exportJwk(key as Key)
+    const input = Redacted.isRedacted(key) ? Redacted.value(key) : key
+    const jwk: Record<string, unknown> = isObject(input) ? { ...input } : yield* exportAnyJwk(input as Key)
     if (typeof jwk.kty !== "string") return yield* Effect.die(new TypeError("Key must be a Crypto.Key or JSON Web Key"))
     if (digest !== "sha256" && digest !== "sha384" && digest !== "sha512") {
       return yield* Effect.die(new TypeError("digest must one of \"sha256\", \"sha384\", or \"sha512\""))
@@ -931,7 +1070,7 @@ export const thumbprint = (
       `SHA-${digest.slice(-3)}` as Crypto.DigestAlgorithm,
       encoder.encode(JSON.stringify(components))
     )
-    return b64u(hash)
+    return b64u(hash) as Thumbprint
   })
 
 /**
@@ -942,10 +1081,10 @@ export const thumbprint = (
  * @since 4.0.0
  */
 export const thumbprintUri = (
-  key: Jwk | Key,
+  key: Jwk | Key | Redacted.Redacted<Jwk>,
   digest: ThumbprintDigest = "sha256"
-): Effect.Effect<string, KeyError, Crypto.Crypto> =>
+): Effect.Effect<ThumbprintUri, KeyError, Crypto.Crypto> =>
   Effect.map(
     thumbprint(key, digest),
-    (value) => `urn:ietf:params:oauth:jwk-thumbprint:sha-${digest.slice(-3)}:${value}`
+    (value) => `urn:ietf:params:oauth:jwk-thumbprint:sha-${digest.slice(-3)}:${value}` as ThumbprintUri
   )

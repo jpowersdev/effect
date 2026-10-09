@@ -14,8 +14,10 @@ import * as Clock from "../Clock.ts"
 import type * as Crypto from "../Crypto.ts"
 import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
+import type * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
-import { attemptWith, isObject, parseHeader, raise, strictDecoder } from "./internal/shared.ts"
+import { attemptWith, isObject, parseHeader, raise, readToken, strictDecoder } from "./internal/shared.ts"
+import type * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
 import * as JsonWebEncryption from "./JsonWebEncryption.ts"
 import * as JsonWebSignature from "./JsonWebSignature.ts"
 
@@ -122,6 +124,54 @@ export type VerifyError = JsonWebSignature.VerifyError | ClaimsError
  */
 export type DecryptError = JsonWebEncryption.DecryptError | ClaimsError
 
+/**
+ * Schema for a signed JWT: a JWS in compact serialization with a base64url
+ * payload.
+ *
+ * **Details**
+ *
+ * The brand records the format, not that the token was verified. Functions
+ * that read tokens accept any string, since incoming tokens are untrusted.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Signed = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+$/, { expected: "a signed JWT" })
+).pipe(Schema.brand("~effect/jose/JsonWebToken/Signed"))
+
+/**
+ * A signed JWT.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Signed = typeof Signed.Type
+
+/**
+ * Schema for an encrypted JWT: a JWE in compact serialization.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Encrypted = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/, {
+    expected: "an encrypted JWT"
+  })
+).pipe(Schema.brand("~effect/jose/JsonWebToken/Encrypted"))
+
+/**
+ * An encrypted JWT.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Encrypted = typeof Encrypted.Type
+
 const malformed = (message: string) => new MalformedJwtError({ message })
 const attemptClaims = attemptWith<ClaimsError>()
 
@@ -212,7 +262,7 @@ export interface IssueOptions {
  */
 export interface SignOptions extends IssueOptions {
   readonly key: JsonWebSignature.Key
-  readonly protectedHeader: JsonWebSignature.Header & { readonly alg: string }
+  readonly protectedHeader: JsonWebSignature.Header & { readonly alg: JsonWebAlgorithm.SignatureAlgorithm }
   readonly crit?: Readonly<Record<string, boolean>> | undefined
 }
 
@@ -360,20 +410,27 @@ const rejectUnencoded = () => raise(malformed("JWTs MUST NOT use unencoded paylo
  * @category signing
  * @since 4.0.0
  */
-export const sign = (
-  claims: Claims,
-  options: SignOptions
-): Effect.Effect<string, SignError, Crypto.Crypto> =>
-  Effect.flatMap(Clock.currentTimeMillis, (now) =>
-    Effect.flatMap(
-      attemptWith<never>()(() => buildClaims(claims, options, now)),
-      (payload) =>
-        JsonWebSignature.signCompact(
-          payload,
-          { key: options.key, protectedHeader: options.protectedHeader, crit: options.crit },
-          rejectUnencoded
-        )
-    ))
+export const sign: {
+  <S extends Schema.Constraint>(
+    claims: S["Type"],
+    options: SignOptions & { readonly schema: S }
+  ): Effect.Effect<Redacted.Redacted<Signed>, SignError | ClaimValidationError, Crypto.Crypto | S["EncodingServices"]>
+  (claims: Claims, options: SignOptions): Effect.Effect<Redacted.Redacted<Signed>, SignError, Crypto.Crypto>
+} = (
+  claims: unknown,
+  options: SignOptions & { readonly schema?: Schema.Constraint }
+): Effect.Effect<Redacted.Redacted<Signed>, any, any> =>
+  Effect.gen(function*() {
+    const encoded = options.schema === undefined ? claims as Claims : yield* encodeWith(options.schema, claims)
+    const now = yield* Clock.currentTimeMillis
+    const payload = yield* attemptWith<never>()(() => buildClaims(encoded, options, now))
+    const token = yield* JsonWebSignature.signCompact(
+      payload,
+      { key: options.key, protectedHeader: options.protectedHeader, crit: options.crit },
+      rejectUnencoded
+    )
+    return token as unknown as Redacted.Redacted<Signed>
+  })
 
 const durationSeconds = (label: string, input: Duration.Input): number => {
   const duration = Duration.fromInput(input)
@@ -477,9 +534,23 @@ export const validateClaims = (
   return payload
 }
 
+const schemaMismatch = (cause: unknown) =>
+  new ClaimValidationError({ message: "JWT Claims Set does not match the schema", check: "invalid", cause })
+
+const encodeWith = <S extends Schema.Constraint>(schema: S, claims: unknown) =>
+  Effect.flatMap(
+    Effect.mapError(Schema.encodeUnknownEffect(schema)(claims, { reportInput: false }), schemaMismatch),
+    (encoded): Effect.Effect<Claims, ClaimValidationError> =>
+      isObject(encoded)
+        ? Effect.succeed(encoded as Claims)
+        : Effect.fail(
+          new ClaimValidationError({ message: "JWT Claims Set must encode to a JSON object", check: "invalid" })
+        )
+  )
+
 const decodeWith = <S extends Schema.Constraint>(schema: S) => (payload: Record<string, unknown>) =>
   Effect.mapError(
-    Schema.decodeUnknownEffect(schema)(payload),
+    Schema.decodeUnknownEffect(schema)(payload, { reportInput: false }),
     (cause) =>
       new ClaimValidationError({
         message: "JWT Claims Set does not match the schema",
@@ -507,17 +578,17 @@ const decodeWith = <S extends Schema.Constraint>(schema: S) => (payload: Record<
  */
 export const verify: {
   <S extends Schema.Constraint, E = never, R = never>(
-    token: string | Uint8Array,
+    token: JsonWebSignature.TokenInput,
     key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
     options: VerifyOptions & { readonly schema: S }
   ): Effect.Effect<Result<S["Type"]>, VerifyError | E, Crypto.Crypto | R | S["DecodingServices"]>
   <E = never, R = never>(
-    token: string | Uint8Array,
+    token: JsonWebSignature.TokenInput,
     key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
     options?: VerifyOptions
   ): Effect.Effect<Result<Claims>, VerifyError | E, Crypto.Crypto | R>
 } = <E, R>(
-  token: string | Uint8Array,
+  token: JsonWebSignature.TokenInput,
   key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
   options?: VerifyOptions & { readonly schema?: Schema.Constraint }
 ): Effect.Effect<Result<any>, VerifyError | E, any> =>
@@ -545,7 +616,10 @@ export const verify: {
  * @since 4.0.0
  */
 export interface EncryptOptions extends IssueOptions, Omit<JsonWebEncryption.EncryptOptions, "protectedHeader"> {
-  readonly protectedHeader: JsonWebEncryption.Header & { readonly alg: string; readonly enc: string }
+  readonly protectedHeader: JsonWebEncryption.Header & {
+    readonly alg: JsonWebAlgorithm.KeyManagementAlgorithm
+    readonly enc: JsonWebAlgorithm.ContentEncryptionAlgorithm
+  }
   readonly replicateIssuerAsHeader?: boolean | undefined
   readonly replicateSubjectAsHeader?: boolean | undefined
   readonly replicateAudienceAsHeader?: boolean | undefined
@@ -558,22 +632,37 @@ export interface EncryptOptions extends IssueOptions, Omit<JsonWebEncryption.Enc
  * @category encryption
  * @since 4.0.0
  */
-export const encrypt = (
-  claims: Claims,
-  options: EncryptOptions
-): Effect.Effect<string, JsonWebEncryption.EncryptError, Crypto.Crypto> =>
+export const encrypt: {
+  <S extends Schema.Constraint>(
+    claims: S["Type"],
+    options: EncryptOptions & { readonly schema: S }
+  ): Effect.Effect<
+    Redacted.Redacted<Encrypted>,
+    JsonWebEncryption.EncryptError | ClaimValidationError,
+    Crypto.Crypto | S["EncodingServices"]
+  >
+  (
+    claims: Claims,
+    options: EncryptOptions
+  ): Effect.Effect<Redacted.Redacted<Encrypted>, JsonWebEncryption.EncryptError, Crypto.Crypto>
+} = (
+  claims: unknown,
+  options: EncryptOptions & { readonly schema?: Schema.Constraint }
+): Effect.Effect<Redacted.Redacted<Encrypted>, any, any> =>
   Effect.gen(function*() {
+    const encoded = options.schema === undefined ? claims as Claims : yield* encodeWith(options.schema, claims)
     const now = yield* Clock.currentTimeMillis
-    const bytes = yield* attemptWith<never>()(() => buildClaims(claims, options, now))
+    const bytes = yield* attemptWith<never>()(() => buildClaims(encoded, options, now))
     const payload = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>
     const protectedHeader: Record<string, unknown> = { ...options.protectedHeader }
     if (options.replicateIssuerAsHeader) protectedHeader.iss = payload.iss
     if (options.replicateSubjectAsHeader) protectedHeader.sub = payload.sub
     if (options.replicateAudienceAsHeader) protectedHeader.aud = payload.aud
-    return yield* JsonWebEncryption.encryptCompact(bytes, {
+    const token = yield* JsonWebEncryption.encryptCompact(bytes, {
       ...options,
       protectedHeader: protectedHeader as JsonWebEncryption.Header
     })
+    return token as unknown as Redacted.Redacted<Encrypted>
   })
 
 /**
@@ -599,17 +688,17 @@ export interface DecryptOptions extends ClaimsOptions, JsonWebEncryption.Decrypt
  */
 export const decrypt: {
   <S extends Schema.Constraint, E = never, R = never>(
-    token: string | Uint8Array,
+    token: JsonWebSignature.TokenInput,
     key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
     options: DecryptOptions & { readonly schema: S }
   ): Effect.Effect<Result<S["Type"]>, DecryptError | E, Crypto.Crypto | R | S["DecodingServices"]>
   <E = never, R = never>(
-    token: string | Uint8Array,
+    token: JsonWebSignature.TokenInput,
     key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
     options?: DecryptOptions
   ): Effect.Effect<Result<Claims>, DecryptError | E, Crypto.Crypto | R>
 } = <E, R>(
-  token: string | Uint8Array,
+  token: JsonWebSignature.TokenInput,
   key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
   options?: DecryptOptions & { readonly schema?: Schema.Constraint }
 ): Effect.Effect<Result<any>, DecryptError | E, any> =>
@@ -645,12 +734,11 @@ export const decrypt: {
  * @category decoding
  * @since 4.0.0
  */
-export const decodeUnverified = (token: string): Effect.Effect<Claims, MalformedJwtError> =>
+export const decodeUnverified = (token: JsonWebSignature.TokenInput): Effect.Effect<Claims, MalformedJwtError> =>
   attemptWith<MalformedJwtError>()(() => {
-    if (typeof token !== "string") {
-      throw new TypeError("JWTs must use Compact JWS serialization, JWT must be a string")
-    }
-    const parts = token.split(".")
+    const input = readToken(token)
+    if (input === undefined) throw new TypeError("JWT must be a string, Uint8Array, or Redacted")
+    const parts = input.split(".")
     if (parts.length === 5) {
       return raise(malformed("Only JWTs using Compact JWS serialization can be decoded"))
     }

@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
-import { JsonWebKey, JsonWebSignature } from "effect/jose"
+import { type JsonWebAlgorithm, JsonWebKey, JsonWebSignature } from "effect/jose"
+import * as Redacted from "effect/Redacted"
 import { CryptoLive, text, utf8 } from "./utils.ts"
 
 // RFC 7515 Appendix A.1
@@ -14,7 +15,7 @@ const rfcToken = "eyJ0eXAiOiJKV1QiLA0KICJhbGciOiJIUzI1NiJ9" +
 
 const signatureAlgorithms = ["HS256", "HS512", "RS256", "PS256", "ES256", "ES384", "ES512", "EdDSA"] as const
 
-const keyPairFor = (alg: string) =>
+const keyPairFor = (alg: JsonWebAlgorithm.SignatureAlgorithm) =>
   alg.startsWith("HS")
     ? Effect.map(JsonWebKey.generateSecret(alg), (secret) => ({ sign: secret, verify: secret }))
     : Effect.map(JsonWebKey.generateKeyPair(alg), (pair) => ({ sign: pair.privateKey, verify: pair.publicKey }))
@@ -43,7 +44,7 @@ describe("JsonWebSignature", () => {
     Effect.gen(function*() {
       const secret = utf8("a-string-secret-at-least-256-bits-long")
       const jws = yield* JsonWebSignature.signCompact("hello", { key: secret, protectedHeader: { alg: "HS256" } })
-      const [header, , signature] = jws.split(".")
+      const [header, , signature] = Redacted.value(jws).split(".")
       const error = yield* Effect.flip(
         JsonWebSignature.verifyCompact(`${header}.aGVsbG8h.${signature}`, secret)
       )
@@ -85,7 +86,7 @@ describe("JsonWebSignature", () => {
   it.effect("supports unencoded payloads and critical extensions", () =>
     Effect.gen(function*() {
       const secret = utf8("a-string-secret-at-least-256-bits-long")
-      const header = { alg: "HS256", b64: false, crit: ["b64"] }
+      const header = { alg: "HS256", b64: false, crit: ["b64"] } as const
       const jws = yield* JsonWebSignature.signFlattened("$.02", { key: secret, protectedHeader: header })
       assert.strictEqual(jws.payload, "$.02")
       const { payload } = yield* JsonWebSignature.verifyFlattened(jws, secret)

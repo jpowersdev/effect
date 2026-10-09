@@ -17,6 +17,7 @@
  */
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
 import {
   type EncEntry,
@@ -38,8 +39,10 @@ import {
   isObject,
   JWE_RECOGNIZED,
   mapPlatformError,
+  maxTokenLength,
   parseHeader,
   raise,
+  readToken,
   serializeHeader,
   timingSafeEqual,
   uint32be,
@@ -61,6 +64,7 @@ import {
   unsupportedByRuntime,
   UnsupportedKeyError
 } from "./JsonWebKey.ts"
+import type { Base64Url, TokenInput } from "./JsonWebSignature.ts"
 
 /**
  * Error raised when a JWE is structurally invalid: the wrong number of
@@ -131,7 +135,50 @@ export type EncryptError = MalformedJweError | UnsupportedJweHeaderError | KeyEr
  * @category errors
  * @since 4.0.0
  */
-export type DecryptError = EncryptError | AlgorithmNotAllowedError | DecryptionError
+export type DecryptError = EncryptError | AlgorithmNotAllowedError | DecryptionError | JweTooLargeError
+
+/**
+ * Error raised when a compact JWE is longer than `maxTokenLength`, before any
+ * decoding or parsing.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class JweTooLargeError
+  extends Schema.TaggedError<JweTooLargeError>("effect/jose/JsonWebEncryption/JweTooLargeError")(
+    "JweTooLargeError",
+    { message: Schema.String, length: Schema.Number, maxLength: Schema.Number }
+  )
+{}
+
+/**
+ * Schema for a JWE in compact serialization: five base64url segments, of
+ * which the encrypted key, initialization vector, and tag may be empty.
+ *
+ * **Details**
+ *
+ * The brand records the format, not that the token was decrypted. Functions
+ * that read tokens accept any string, since incoming tokens are untrusted.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Compact = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/, {
+    expected: "a JWE in compact serialization"
+  })
+).pipe(Schema.brand("~effect/jose/JsonWebEncryption/Compact"))
+
+/**
+ * A JWE in compact serialization.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Compact = typeof Compact.Type
 
 const malformed = (message: string) => new MalformedJweError({ message })
 const unsupportedHeader = (message: string) => new UnsupportedJweHeaderError({ message })
@@ -148,8 +195,8 @@ const attempt = attemptWith<DecryptError>()
  * @since 4.0.0
  */
 export interface Header {
-  readonly alg?: JsonWebAlgorithm.KeyManagementAlgorithm | (string & {}) | undefined
-  readonly enc?: JsonWebAlgorithm.ContentEncryptionAlgorithm | (string & {}) | undefined
+  readonly alg?: JsonWebAlgorithm.KeyManagementAlgorithm | undefined
+  readonly enc?: JsonWebAlgorithm.ContentEncryptionAlgorithm | undefined
   readonly kid?: string | undefined
   readonly typ?: string | undefined
   readonly cty?: string | undefined
@@ -195,6 +242,42 @@ export interface General {
 }
 
 /**
+ * A flattened JWE produced by {@link encryptFlattened}, with its base64url
+ * members branded.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface EncryptedFlattened extends Flattened {
+  readonly protected?: Base64Url | undefined
+  readonly encrypted_key?: Base64Url | undefined
+  readonly iv?: Base64Url | undefined
+  readonly ciphertext: Base64Url
+  readonly tag?: Base64Url | undefined
+  readonly aad?: Base64Url | undefined
+}
+
+/**
+ * A general JWE produced by {@link encryptGeneral}, with its base64url
+ * members branded.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface EncryptedGeneral extends General {
+  readonly protected?: Base64Url | undefined
+  readonly recipients: ReadonlyArray<
+    { readonly header?: Header | undefined; readonly encrypted_key?: Base64Url | undefined }
+  >
+  readonly iv?: Base64Url | undefined
+  readonly ciphertext: Base64Url
+  readonly tag?: Base64Url | undefined
+  readonly aad?: Base64Url | undefined
+}
+
+/**
  * A key accepted by JWE operations: a `Crypto.Key`, raw secret bytes for
  * symmetric algorithms, or a JSON Web Key.
  *
@@ -208,7 +291,12 @@ export interface General {
  * @category models
  * @since 4.0.0
  */
-export type Key = Crypto.Key | Uint8Array | Crypto.JwkData
+export type Key =
+  | Crypto.Key
+  | Uint8Array
+  | Crypto.JwkData
+  | Redacted.Redacted<Uint8Array>
+  | Redacted.Redacted<Crypto.JwkData>
 
 /**
  * Selects a decryption key from a JWE's headers.
@@ -239,7 +327,7 @@ export type KeyResolver<E = never, R = never> = (
 export interface KeyManagementParameters {
   readonly apu?: Uint8Array | undefined
   readonly apv?: Uint8Array | undefined
-  readonly epk?: Crypto.Key | Crypto.JwkData | undefined
+  readonly epk?: Crypto.Key | Crypto.JwkData | Redacted.Redacted<Crypto.JwkData> | undefined
   readonly p2c?: number | undefined
   readonly p2s?: Uint8Array | undefined
   readonly iv?: Uint8Array | undefined
@@ -284,8 +372,9 @@ export interface EncryptOptions {
  * @since 4.0.0
  */
 export interface DecryptOptions {
-  readonly keyManagementAlgorithms?: ReadonlyArray<string> | undefined
-  readonly contentEncryptionAlgorithms?: ReadonlyArray<string> | undefined
+  readonly keyManagementAlgorithms?: ReadonlyArray<JsonWebAlgorithm.KeyManagementAlgorithm> | undefined
+  readonly contentEncryptionAlgorithms?: ReadonlyArray<JsonWebAlgorithm.ContentEncryptionAlgorithm> | undefined
+  readonly maxTokenLength?: number | undefined
   readonly crit?: Readonly<Record<string, boolean>> | undefined
   readonly maxPBES2Count?: number | undefined
 }
@@ -574,12 +663,13 @@ const encryptKeyManagement = (
         yield* attemptEncrypt(() => checkPartyInfo(apu, apv))
         let ephemeralPrivate: Crypto.Key
         let ephemeralPublic: Crypto.Key | Crypto.JwkData | undefined
-        if (provided.epk !== undefined) {
-          ephemeralPrivate = (yield* prepareKey(entry, provided.epk, "decrypt")) as Crypto.Key
-          if (isObject(provided.epk)) {
+        const providedEpk = Redacted.isRedacted(provided.epk) ? Redacted.value(provided.epk) : provided.epk
+        if (providedEpk !== undefined) {
+          ephemeralPrivate = (yield* prepareKey(entry, providedEpk, "decrypt")) as Crypto.Key
+          if (isObject(providedEpk)) {
             // A private JWK already carries its public members, so the public
             // key does not need to be exported from the imported handle.
-            ephemeralPublic = provided.epk as Crypto.JwkData
+            ephemeralPublic = providedEpk as Crypto.JwkData
           } else if (!ephemeralPrivate.extractable) {
             return yield* Effect.fail(invalidKey("Key for \"epk\" must be extractable"))
           }
@@ -799,7 +889,7 @@ const encryptJwe = (
   checked: Checked,
   options: EncryptOptions,
   unprotectedParameters = false
-): Effect.Effect<Flattened, EncryptError, Crypto.Crypto> =>
+): Effect.Effect<EncryptedFlattened, EncryptError, Crypto.Crypto> =>
   Effect.gen(function*() {
     let { protectedHeader, unprotectedHeader } = checked
     const [cek, encryptedKey, parameters] = yield* encryptKeyManagement(
@@ -839,7 +929,8 @@ const encryptJwe = (
     if (protectedHeader) jwe.protected = protectedString
     if (checked.sharedUnprotectedHeader) jwe.unprotected = checked.sharedUnprotectedHeader
     if (unprotectedHeader) jwe.header = unprotectedHeader
-    return jwe
+    // Every member was produced by base64url encoding.
+    return jwe as EncryptedFlattened
   })
 
 /**
@@ -852,7 +943,7 @@ const encryptJwe = (
 export const encryptFlattened = (
   plaintext: Uint8Array | string,
   options: EncryptOptions
-): Effect.Effect<Flattened, EncryptError, Crypto.Crypto> =>
+): Effect.Effect<EncryptedFlattened, EncryptError, Crypto.Crypto> =>
   Effect.flatMap(
     attemptEncrypt(() => checkEncryptHeaders(options)),
     (checked) => encryptJwe(toBytes(plaintext), checked, options)
@@ -887,10 +978,13 @@ export const encryptCompact = (
   options: Omit<EncryptOptions, "unprotectedHeader" | "sharedUnprotectedHeader" | "additionalAuthenticatedData"> & {
     readonly protectedHeader: Header
   }
-): Effect.Effect<string, EncryptError, Crypto.Crypto> =>
+): Effect.Effect<Redacted.Redacted<Compact>, EncryptError, Crypto.Crypto> =>
   Effect.map(
     encryptFlattened(plaintext, options),
-    (jwe) => [jwe.protected, jwe.encrypted_key ?? "", jwe.iv ?? "", jwe.ciphertext, jwe.tag ?? ""].join(".")
+    (jwe) =>
+      Redacted.make(
+        [jwe.protected, jwe.encrypted_key ?? "", jwe.iv ?? "", jwe.ciphertext, jwe.tag ?? ""].join(".") as Compact
+      )
   )
 
 /**
@@ -927,7 +1021,7 @@ export const encryptGeneral = (
     readonly sharedUnprotectedHeader?: Header | undefined
     readonly additionalAuthenticatedData?: Uint8Array | undefined
   }
-): Effect.Effect<General, EncryptError, Crypto.Crypto> =>
+): Effect.Effect<EncryptedGeneral, EncryptError, Crypto.Crypto> =>
   Effect.gen(function*() {
     const { recipients } = options
     if (recipients.length === 0) return yield* Effect.fail(malformed("at least one recipient must be added"))
@@ -964,7 +1058,7 @@ export const encryptGeneral = (
       keyManagementParameters: recipients[0].keyManagementParameters,
       crit: recipients[0].crit
     }, multiple)
-    const out: Array<{ header?: Header; encrypted_key?: string }> = [{}]
+    const out: Array<{ header?: Header; encrypted_key?: Base64Url }> = [{}]
     if (encrypted_key) out[0].encrypted_key = encrypted_key
     if (header) out[0].header = header
     for (let i = 1; i < recipients.length; i++) {
@@ -977,7 +1071,7 @@ export const encryptGeneral = (
         cek,
         recipients[i].keyManagementParameters
       )
-      const target: { header?: Header; encrypted_key?: string } = { encrypted_key: b64u(encryptedKey!) }
+      const target: { header?: Header; encrypted_key?: Base64Url } = { encrypted_key: b64u(encryptedKey!) as Base64Url }
       if (checked.unprotectedHeader || parameters) {
         const merged = { ...checked.unprotectedHeader, ...parameters }
         if (parameters) {
@@ -987,7 +1081,7 @@ export const encryptGeneral = (
       }
       out.push(target)
     }
-    return { ...shared, recipients: out } as General
+    return { ...shared, recipients: out } as EncryptedGeneral
   })
 
 const snapshotShared = (jwe: Record<string, unknown>) => {
@@ -1151,13 +1245,23 @@ const decryptJwe = <E, R>(
  * @since 4.0.0
  */
 export const decryptCompact = <E = never, R = never>(
-  jwe: string | Uint8Array,
+  jwe: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: DecryptOptions
 ): Effect.Effect<DecryptResult, DecryptError | E, Crypto.Crypto | R> =>
   Effect.suspend(() => {
-    const input = jwe instanceof Uint8Array ? new TextDecoder().decode(jwe) : jwe
-    if (typeof input !== "string") return Effect.fail(malformed("Compact JWE must be a string or Uint8Array"))
+    const input = readToken(jwe)
+    if (input === undefined) return Effect.die(new TypeError("Compact JWE must be a string, Uint8Array, or Redacted"))
+    const limit = maxTokenLength(options?.maxTokenLength)
+    if (input.length > limit) {
+      return Effect.fail(
+        new JweTooLargeError({
+          message: `Compact JWE is ${input.length} characters, more than the limit of ${limit}`,
+          length: input.length,
+          maxLength: limit
+        })
+      )
+    }
     const parts = input.split(".")
     if (parts.length !== 5) return Effect.fail(malformed("Invalid Compact JWE"))
     const [protectedHeader, encryptedKey, iv, ciphertext, tag] = parts

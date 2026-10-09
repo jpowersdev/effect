@@ -28,7 +28,7 @@ describe("JsonWebToken", () => {
         iat: NOW / 1000,
         exp: NOW / 1000 + 3600
       })
-      const options = { algorithms: ["HS256"], issuer: "urn:issuer", audience: "urn:audience" }
+      const options = { algorithms: ["HS256"], issuer: "urn:issuer", audience: "urn:audience" } as const
       yield* JsonWebToken.verify(token, secret, options)
       yield* TestClock.adjust("1 hour")
       const expired = yield* Effect.flip(JsonWebToken.verify(token, secret, options))

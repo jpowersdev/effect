@@ -1,13 +1,17 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
-import { JsonWebEncryption, JsonWebKey } from "effect/jose"
+import { type JsonWebAlgorithm, JsonWebEncryption, JsonWebKey } from "effect/jose"
+import * as Redacted from "effect/Redacted"
 import { CryptoLive, text, utf8 } from "./utils.ts"
 
 const plaintext = "Live long and prosper."
 
 const contentEncryption = ["A128GCM", "A256GCM", "A128CBC-HS256", "A256CBC-HS512"] as const
 
-const recipientFor = (alg: string, enc: string) =>
+const recipientFor = (
+  alg: JsonWebAlgorithm.KeyManagementAlgorithm,
+  enc: JsonWebAlgorithm.ContentEncryptionAlgorithm
+) =>
   Effect.gen(function*() {
     if (alg === "dir") {
       const key = yield* JsonWebKey.generateSecret(enc)
@@ -72,7 +76,7 @@ describe("JsonWebEncryption", () => {
         iv
       })
       assert.strictEqual(
-        jwe,
+        Redacted.value(jwe),
         "eyJhbGciOiJBMTI4S1ciLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0." +
           "6KB707dM9YTIgHtLvtgWQ8mKwboJW3of9locizkDTHzBC2IlrT1oOQ." +
           "AxY8DCtDaGlsbGljb3RoZQ." +
@@ -171,7 +175,7 @@ describe("JsonWebEncryption", () => {
     Effect.gen(function*() {
       const recipient = yield* JsonWebKey.generateKeyPair("ECDH-ES")
       const ephemeral = yield* JsonWebKey.generateKeyPair("ECDH-ES", { extractable: true })
-      const epk = yield* JsonWebKey.exportJwk(ephemeral.privateKey)
+      const epk = yield* JsonWebKey.exportPrivateJwk(ephemeral.privateKey)
       const jwe = yield* JsonWebEncryption.encryptCompact(plaintext, {
         key: recipient.publicKey,
         protectedHeader: { alg: "ECDH-ES", enc: "A256GCM" },
@@ -182,7 +186,7 @@ describe("JsonWebEncryption", () => {
         recipient.privateKey
       )
       assert.strictEqual(text(decrypted), plaintext)
-      assert.deepStrictEqual((protectedHeader!.epk as any).x, epk.x)
+      assert.deepStrictEqual((protectedHeader!.epk as any).x, Redacted.value(epk).x)
       assert.isUndefined((protectedHeader!.epk as any).d)
     }).pipe(Effect.provide(CryptoLive)))
 

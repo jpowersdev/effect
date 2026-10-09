@@ -1,6 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import { JsonWebKey, JsonWebKeySet, JsonWebSignature } from "effect/jose"
+import * as Redacted from "effect/Redacted"
+import * as Schema from "effect/Schema"
 import { CryptoLive, utf8 } from "./utils.ts"
 
 describe("JsonWebKey", () => {
@@ -18,21 +20,28 @@ describe("JsonWebKey", () => {
 
   it.effect("round-trips keys through JWK and PEM", () =>
     Effect.gen(function*() {
-      for (const alg of ["RS256", "ES256", "EdDSA", "ECDH-ES"]) {
+      for (const alg of ["RS256", "ES256", "EdDSA", "ECDH-ES"] as const) {
         const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair(alg, { extractable: true })
         const jwk = yield* JsonWebKey.exportJwk(publicKey)
         const imported = yield* JsonWebKey.importJwk(jwk, alg)
         assert.deepStrictEqual(yield* JsonWebKey.exportJwk(imported as any), jwk)
+        const privateJwk = yield* JsonWebKey.exportPrivateJwk(privateKey)
+        assert.isTrue(Redacted.isRedacted(privateJwk))
+        assert.strictEqual(String(privateJwk), "<redacted>")
+        const notPublic = yield* Effect.flip(JsonWebKey.exportJwk(privateKey))
+        assert.strictEqual(notPublic._tag, "InvalidKeyError")
         const spki = yield* JsonWebKey.exportSpki(publicKey)
         assert.match(spki, /^-----BEGIN PUBLIC KEY-----\n/)
+        assert.strictEqual(spki, yield* Schema.decodeUnknownEffect(JsonWebKey.SpkiPem)(spki))
         const fromSpki = yield* JsonWebKey.importSpki(spki, alg)
         assert.strictEqual(fromSpki.type, "public")
         const pkcs8 = yield* JsonWebKey.exportPkcs8(privateKey)
+        assert.isTrue(Redacted.isRedacted(pkcs8))
         const fromPkcs8 = yield* JsonWebKey.importPkcs8(pkcs8, alg)
         assert.strictEqual(fromPkcs8.type, "private")
         assert.strictEqual(
           yield* JsonWebKey.thumbprint(publicKey),
-          yield* JsonWebKey.thumbprint(yield* JsonWebKey.exportJwk(privateKey))
+          yield* JsonWebKey.thumbprint(yield* JsonWebKey.exportPrivateJwk(privateKey))
         )
       }
     }).pipe(Effect.provide(CryptoLive)))

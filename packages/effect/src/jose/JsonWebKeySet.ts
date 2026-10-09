@@ -13,11 +13,13 @@ import * as Clock from "../Clock.ts"
 import type * as Crypto from "../Crypto.ts"
 import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
+import * as FetchHttpClient from "../http/FetchHttpClient.ts"
 import * as HttpClient from "../http/HttpClient.ts"
 import type * as HttpClientError from "../http/HttpClientError.ts"
 import * as KeyValueStore from "../persistence/KeyValueStore.ts"
 import * as Schema from "../Schema.ts"
 import * as Semaphore from "../Semaphore.ts"
+import * as Stream from "../Stream.ts"
 import { JWS } from "./internal/algorithms.ts"
 import { isObject } from "./internal/shared.ts"
 import { UnsupportedAlgorithmError } from "./JsonWebAlgorithm.ts"
@@ -98,6 +100,37 @@ export class KeySetTimeoutError
 {}
 
 /**
+ * Error raised when a remote key set URL is not acceptable: it is not
+ * `https:` (unless `allowInsecureHttp` is set), or it contains credentials or
+ * a fragment.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class InvalidKeySetUrlError
+  extends Schema.TaggedError<InvalidKeySetUrlError>("effect/jose/JsonWebKeySet/InvalidKeySetUrlError")(
+    "InvalidKeySetUrlError",
+    { message: Schema.String }
+  )
+{}
+
+/**
+ * Error raised when a remote key set response exceeds `maxResponseBytes`, or
+ * the set has more than `maxKeys` keys.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class KeySetTooLargeError
+  extends Schema.TaggedError<KeySetTooLargeError>("effect/jose/JsonWebKeySet/KeySetTooLargeError")(
+    "KeySetTooLargeError",
+    { message: Schema.String, url: Schema.String }
+  )
+{}
+
+/**
  * Failures from selecting a key from a key set.
  *
  * @stability unstable
@@ -118,7 +151,7 @@ export type SelectError =
  * @category errors
  * @since 4.0.0
  */
-export type RemoteSelectError = SelectError | KeySetFetchError | KeySetTimeoutError
+export type RemoteSelectError = SelectError | KeySetFetchError | KeySetTimeoutError | KeySetTooLargeError
 
 /**
  * A JSON Web Key Set.
@@ -294,17 +327,26 @@ export type Storage = "memory" | "keyValueStore"
  *   unknown key (30 seconds by default).
  * - `timeoutDuration`: request timeout (5 seconds by default).
  * - `headers`: additional request headers.
+ * - `allowInsecureHttp`: permit `http:` URLs, for local development and
+ *   tests. Off by default.
+ * - `maxResponseBytes`: largest accepted response body (128 KiB by default).
+ * - `maxKeys`: most keys accepted in the set (64 by default).
  * - `storage`: see {@link Storage}.
  * - `storageKey`: the `KeyValueStore` key (derived from the URL by default).
  *
  * To customize how the set is fetched (fetch implementation, retries,
- * tracing), provide a customized `HttpClient`.
+ * tracing), provide a customized `HttpClient`. Redirects are refused: the
+ * request asks `fetch` to fail on redirects, and any response from a
+ * different URL is rejected, whichever client is used.
  *
  * @stability unstable
  * @category models
  * @since 4.0.0
  */
 export interface RemoteOptions extends LocalOptions {
+  readonly allowInsecureHttp?: boolean | undefined
+  readonly maxResponseBytes?: number | undefined
+  readonly maxKeys?: number | undefined
   readonly cacheMaxAge?: Duration.Input | undefined
   readonly cooldownDuration?: Duration.Input | undefined
   readonly timeoutDuration?: Duration.Input | undefined
@@ -335,6 +377,37 @@ export type StorageError<O> = O extends { readonly storage: "keyValueStore" } ? 
 
 const StoredKeySet = Schema.fromJsonString(Schema.Struct({ fetchedAt: Schema.Finite, jwks: JwkSet }))
 
+const validateUrl = (url: string | URL, allowInsecureHttp: boolean): Effect.Effect<URL, InvalidKeySetUrlError> => {
+  let parsed: URL
+  try {
+    parsed = new URL(url.toString())
+  } catch {
+    return Effect.fail(new InvalidKeySetUrlError({ message: "JSON Web Key Set URL is not a valid URL" }))
+  }
+  if (parsed.protocol !== "https:" && !(allowInsecureHttp && parsed.protocol === "http:")) {
+    return Effect.fail(
+      new InvalidKeySetUrlError({ message: "JSON Web Key Set URL must use https: (or set allowInsecureHttp)" })
+    )
+  }
+  if (parsed.username !== "" || parsed.password !== "") {
+    return Effect.fail(new InvalidKeySetUrlError({ message: "JSON Web Key Set URL must not contain credentials" }))
+  }
+  if (parsed.hash !== "") {
+    return Effect.fail(new InvalidKeySetUrlError({ message: "JSON Web Key Set URL must not contain a fragment" }))
+  }
+  return Effect.succeed(parsed)
+}
+
+const concatChunks = (chunks: ReadonlyArray<Uint8Array>): Uint8Array => {
+  const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0))
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.length
+  }
+  return out
+}
+
 /**
  * Creates a resolver backed by a key set fetched over HTTP.
  *
@@ -356,15 +429,18 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
   options?: O
 ): Effect.Effect<
   Resolver<RemoteSelectError | StorageError<O>>,
-  never,
+  InvalidKeySetUrlError,
   HttpClient.HttpClient | StorageServices<O>
 > =>
   Effect.gen(function*() {
+    const parsed = yield* validateUrl(url, options?.allowInsecureHttp === true)
     const client = yield* HttpClient.HttpClient
     const store = options?.storage === "keyValueStore"
       ? yield* Effect.service(KeyValueStore.KeyValueStore)
       : undefined
-    const href = url.toString()
+    const href = parsed.href
+    const maxResponseBytes = options?.maxResponseBytes ?? 131_072
+    const maxKeys = options?.maxKeys ?? 64
     const storageKey = options?.storageKey ?? `effect/jose/JsonWebKeySet/${href}`
     const cacheMaxAge = Duration.toMillis(options?.cacheMaxAge ?? Duration.minutes(10))
     const cooldown = Duration.toMillis(options?.cooldownDuration ?? Duration.seconds(30))
@@ -374,24 +450,61 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
     let local: Resolver | undefined
     let fetchedAt = -Infinity
 
-    const fetchSet: Effect.Effect<unknown, KeySetFetchError | KeySetTimeoutError> = client.get(url, {
+    const tooLarge = (message: string) => new KeySetTooLargeError({ url: href, message })
+
+    const readBody = (stream: Stream.Stream<Uint8Array, HttpClientError.HttpClientError>) =>
+      Stream.runFoldEffect(
+        stream,
+        () => [] as Array<Uint8Array>,
+        (chunks, chunk): Effect.Effect<Array<Uint8Array>, KeySetTooLargeError> => {
+          const size = chunks.reduce((total, c) => total + c.length, 0) + chunk.length
+          if (size > maxResponseBytes) {
+            return Effect.fail(tooLarge(`JSON Web Key Set response exceeds ${maxResponseBytes} bytes`))
+          }
+          chunks.push(chunk)
+          return Effect.succeed(chunks)
+        }
+      )
+
+    const fetchSet: Effect.Effect<
+      unknown,
+      KeySetFetchError | KeySetTimeoutError | KeySetTooLargeError
+    > = client.get(href, {
       headers: { accept: "application/json", ...options?.headers }
     }).pipe(
-      Effect.flatMap((response): Effect.Effect<unknown, KeySetFetchError | HttpClientError.HttpClientError> =>
-        response.status === 200
-          ? response.json
-          : Effect.fail(
+      Effect.flatMap((response) => {
+        if (response.status !== 200) {
+          return Effect.fail(
             new KeySetFetchError({
               url: href,
               message: `Expected 200 OK from the JSON Web Key Set HTTP response, received ${response.status}`
             })
           )
+        }
+        if (response.url !== href) {
+          return Effect.fail(
+            new KeySetFetchError({ url: href, message: `Refusing a response from a different URL: ${response.url}` })
+          )
+        }
+        return Effect.flatMap(readBody(response.stream), (chunks) => {
+          const body = new TextDecoder().decode(concatChunks(chunks))
+          return Effect.try({
+            try: () => JSON.parse(body) as unknown,
+            catch: (cause) => new KeySetFetchError({ url: href, message: "Response is not JSON", cause })
+          })
+        })
+      }),
+      Effect.flatMap((json) =>
+        isObject(json) && Array.isArray(json.keys) && json.keys.length > maxKeys
+          ? Effect.fail(tooLarge(`JSON Web Key Set has more than ${maxKeys} keys`))
+          : Effect.succeed(json)
       ),
       Effect.mapError((e) =>
-        e._tag === "KeySetFetchError"
+        e._tag === "KeySetFetchError" || e._tag === "KeySetTooLargeError"
           ? e
           : new KeySetFetchError({ url: href, message: "Failed to fetch the JSON Web Key Set", cause: e })
       ),
+      Effect.provideService(FetchHttpClient.RequestInit, { redirect: "error" }),
       Effect.timeoutOrElse({
         duration: timeout,
         orElse: () => Effect.fail(new KeySetTimeoutError({ url: href, message: "request timed out" }))
@@ -438,6 +551,6 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
     return resolver as Resolver<RemoteSelectError | StorageError<O>>
   }) as unknown as Effect.Effect<
     Resolver<RemoteSelectError | StorageError<O>>,
-    never,
+    InvalidKeySetUrlError,
     HttpClient.HttpClient | StorageServices<O>
   >

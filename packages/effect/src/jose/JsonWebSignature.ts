@@ -12,6 +12,7 @@
  */
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
 import { jwsAlgorithm } from "./internal/algorithms.ts"
 import {
@@ -24,8 +25,10 @@ import {
   isDisjoint,
   isObject,
   JWS_RECOGNIZED,
+  maxTokenLength,
   parseHeader,
   raise,
+  readToken,
   serializeHeader,
   validateAlgorithms,
   validateB64,
@@ -78,6 +81,21 @@ export class UnsupportedJwsHeaderError
 {}
 
 /**
+ * Error raised when a compact JWS is longer than `maxTokenLength`, before any
+ * decoding or parsing.
+ *
+ * @stability unstable
+ * @category errors
+ * @since 4.0.0
+ */
+export class JwsTooLargeError
+  extends Schema.TaggedError<JwsTooLargeError>("effect/jose/JsonWebSignature/JwsTooLargeError")(
+    "JwsTooLargeError",
+    { message: Schema.String, length: Schema.Number, maxLength: Schema.Number }
+  )
+{}
+
+/**
  * Failures from producing a JWS.
  *
  * @stability unstable
@@ -93,7 +111,65 @@ export type SignError = MalformedJwsError | UnsupportedJwsHeaderError | KeyError
  * @category errors
  * @since 4.0.0
  */
-export type VerifyError = SignError | AlgorithmNotAllowedError | SignatureVerificationError
+export type VerifyError = SignError | AlgorithmNotAllowedError | SignatureVerificationError | JwsTooLargeError
+
+/**
+ * Schema for unpadded base64url text, the `BASE64URL` encoding JOSE uses for
+ * every binary member (RFC 7515 section 2).
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Base64Url = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]*$/, { expected: "unpadded base64url text" })
+).pipe(Schema.brand("~effect/jose/Base64Url"))
+
+/**
+ * Unpadded base64url text.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Base64Url = typeof Base64Url.Type
+
+/**
+ * Schema for a JWS in compact serialization: base64url header and signature
+ * around a payload with no `.`.
+ *
+ * **Details**
+ *
+ * The brand records the format, not that the token was verified. Functions
+ * that read tokens accept any string, since incoming tokens are untrusted;
+ * decode with this schema to obtain a branded value at a boundary.
+ *
+ * @stability unstable
+ * @category schemas
+ * @since 4.0.0
+ */
+export const Compact = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]+\.[^.]*\.[A-Za-z0-9_-]+$/, { expected: "a JWS in compact serialization" })
+).pipe(Schema.brand("~effect/jose/JsonWebSignature/Compact"))
+
+/**
+ * A JWS in compact serialization.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Compact = typeof Compact.Type
+
+/**
+ * A token to read: a string, its UTF-8 bytes, or a `Redacted` string such as
+ * the value from `HttpApiSecurity.bearer`.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type TokenInput = string | Uint8Array | Redacted.Redacted<string>
 
 const malformed = (message: string) => new MalformedJwsError({ message })
 const unsupportedHeader = (message: string) => new UnsupportedJwsHeaderError({ message })
@@ -108,7 +184,7 @@ const attempt = attemptWith<VerifyError>()
  * @since 4.0.0
  */
 export interface Header {
-  readonly alg?: JsonWebAlgorithm.SignatureAlgorithm | (string & {}) | undefined
+  readonly alg?: JsonWebAlgorithm.SignatureAlgorithm | undefined
   readonly kid?: string | undefined
   readonly typ?: string | undefined
   readonly cty?: string | undefined
@@ -150,6 +226,37 @@ export interface General {
 }
 
 /**
+ * A flattened JWS produced by {@link signFlattened}, with its base64url
+ * members branded.
+ *
+ * **Details**
+ *
+ * `payload` is base64url text, or the raw payload when the protected header
+ * sets `b64: false`.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface SignedFlattened extends Flattened {
+  readonly protected?: Base64Url | undefined
+  readonly payload: string
+  readonly signature: Base64Url
+}
+
+/**
+ * A general JWS produced by {@link signGeneral}, with its base64url members
+ * branded.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface SignedGeneral extends General {
+  readonly signatures: ReadonlyArray<Omit<SignedFlattened, "payload">>
+}
+
+/**
  * A key accepted by JWS operations: a `Crypto.Key`, raw secret bytes for HMAC
  * algorithms, or a JSON Web Key.
  *
@@ -163,7 +270,12 @@ export interface General {
  * @category models
  * @since 4.0.0
  */
-export type Key = Crypto.Key | Uint8Array | Crypto.JwkData
+export type Key =
+  | Crypto.Key
+  | Uint8Array
+  | Crypto.JwkData
+  | Redacted.Redacted<Uint8Array>
+  | Redacted.Redacted<Crypto.JwkData>
 
 /**
  * Selects a verification key from a token's headers.
@@ -225,8 +337,9 @@ export interface VerifyResult {
  * @since 4.0.0
  */
 export interface VerifyOptions {
-  readonly algorithms?: ReadonlyArray<string> | undefined
+  readonly algorithms?: ReadonlyArray<JsonWebAlgorithm.SignatureAlgorithm> | undefined
   readonly crit?: Readonly<Record<string, boolean>> | undefined
+  readonly maxTokenLength?: number | undefined
 }
 
 /**
@@ -249,7 +362,7 @@ const toBytes = (payload: Uint8Array | string): Uint8Array =>
   typeof payload === "string" ? encoder.encode(payload) : payload
 
 interface Signed {
-  readonly jws: { protected?: string; header?: Header; payload: string; signature: string }
+  readonly jws: { protected?: Base64Url; header?: Header; payload: string; signature: Base64Url }
   readonly b64: boolean
   readonly payloadBytes: Uint8Array
 }
@@ -303,8 +416,8 @@ const createSignature = Effect.fnUntraced(function*(
   if (entry.minRsaBits) yield* attemptSign(() => checkModulusLength(entry.alg, key))
   const crypto = yield* cryptoService
   const signature = yield* crypto.sign(entry.signing, key, prepared.data)
-  const jws: Signed["jws"] = { payload: prepared.payloadString, signature: b64u(signature) }
-  if (prepared.protectedHeader) jws.protected = prepared.protectedString
+  const jws: Signed["jws"] = { payload: prepared.payloadString, signature: b64u(signature) as Base64Url }
+  if (prepared.protectedHeader) jws.protected = prepared.protectedString as Base64Url
   if (prepared.unprotectedHeader) jws.header = prepared.unprotectedHeader as Header
   return { jws, b64: prepared.b64, payloadBytes: payload } satisfies Signed
 })
@@ -343,7 +456,7 @@ export const signCompact = (
   payload: Uint8Array | string,
   options: Omit<SignOptions, "unprotectedHeader"> & { readonly protectedHeader: Header },
   rejectUnencoded?: () => void
-): Effect.Effect<string, SignError, Crypto.Crypto> =>
+): Effect.Effect<Redacted.Redacted<Compact>, SignError, Crypto.Crypto> =>
   Effect.flatMap(createSignature(toBytes(payload), options, rejectUnencoded), ({ b64, jws }) => {
     if (!b64) {
       const raw = typeof payload === "string" ? payload : new TextDecoder().decode(payload)
@@ -352,9 +465,9 @@ export const signCompact = (
           malformed("JWS Compact Serialization payload must use only ASCII characters other than \".\"")
         )
       }
-      return Effect.succeed(`${jws.protected}.${raw}.${jws.signature}`)
+      return Effect.succeed(Redacted.make(`${jws.protected}.${raw}.${jws.signature}` as Compact))
     }
-    return Effect.succeed(`${jws.protected}.${jws.payload}.${jws.signature}`)
+    return Effect.succeed(Redacted.make(`${jws.protected}.${jws.payload}.${jws.signature}` as Compact))
   })
 
 /**
@@ -367,7 +480,7 @@ export const signCompact = (
 export const signFlattened = (
   payload: Uint8Array | string,
   options: SignOptions
-): Effect.Effect<Flattened, SignError, Crypto.Crypto> =>
+): Effect.Effect<SignedFlattened, SignError, Crypto.Crypto> =>
   Effect.map(
     createSignature(toBytes(payload), options),
     ({ b64, jws, payloadBytes }) => b64 ? jws : { ...jws, payload: new TextDecoder().decode(payloadBytes) }
@@ -387,10 +500,10 @@ export const signFlattened = (
 export const signGeneral = Effect.fnUntraced(function*(
   payload: Uint8Array | string,
   signers: ReadonlyArray<SignOptions>
-): Effect.fn.Return<General, SignError, Crypto.Crypto> {
+): Effect.fn.Return<SignedGeneral, SignError, Crypto.Crypto> {
   if (signers.length === 0) return yield* Effect.fail(malformed("at least one signature must be added"))
   const bytes = toBytes(payload)
-  const signatures: Array<Omit<Flattened, "payload">> = []
+  const signatures: Array<Omit<SignedFlattened, "payload">> = []
   let b64: boolean | undefined
   let encoded = ""
   for (const signer of signers) {
@@ -560,13 +673,23 @@ const verifySignature = <E, R>(
 
 /** @internal */
 export const verifyCompactInternal = <E, R>(
-  jws: string | Uint8Array,
+  jws: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
 ): Effect.Effect<VerifyResult & { readonly b64: boolean }, VerifyError | E, Crypto.Crypto | R> =>
   Effect.suspend(() => {
-    const input = jws instanceof Uint8Array ? new TextDecoder().decode(jws) : jws
-    if (typeof input !== "string") return Effect.fail(malformed("Compact JWS must be a string or Uint8Array"))
+    const input = readToken(jws)
+    if (input === undefined) return Effect.die(new TypeError("Compact JWS must be a string, Uint8Array, or Redacted"))
+    const limit = maxTokenLength(options?.maxTokenLength)
+    if (input.length > limit) {
+      return Effect.fail(
+        new JwsTooLargeError({
+          message: `Compact JWS is ${input.length} characters, more than the limit of ${limit}`,
+          length: input.length,
+          maxLength: limit
+        })
+      )
+    }
     const parts = input.split(".")
     if (parts.length !== 3) return Effect.fail(malformed("Invalid Compact JWS"))
     return verifySignature(
@@ -590,7 +713,7 @@ export const verifyCompactInternal = <E, R>(
  * @since 4.0.0
  */
 export const verifyCompact = <E = never, R = never>(
-  jws: string | Uint8Array,
+  jws: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
 ): Effect.Effect<VerifyResult, VerifyError | E, Crypto.Crypto | R> =>
@@ -686,10 +809,11 @@ export const verifyGeneral = <E = never, R = never>(
  * @category decoding
  * @since 4.0.0
  */
-export const decodeProtectedHeader = (token: string): Effect.Effect<Header, MalformedJwsError> =>
+export const decodeProtectedHeader = (token: TokenInput): Effect.Effect<Header, MalformedJwsError> =>
   attemptWith<MalformedJwsError>()(() => {
-    if (typeof token !== "string") throw new TypeError("Token must be a string")
-    const encoded = token.split(".")[0]
+    const input = readToken(token)
+    if (input === undefined) throw new TypeError("Token must be a string, Uint8Array, or Redacted")
+    const encoded = input.split(".")[0]
     return parseHeader(encoded, malformed, "Invalid Token or Protected Header formatting") as Header
   })
 
