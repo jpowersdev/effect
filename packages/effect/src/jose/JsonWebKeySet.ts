@@ -15,6 +15,7 @@ import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
 import * as HttpClient from "../http/HttpClient.ts"
 import type * as HttpClientError from "../http/HttpClientError.ts"
+import * as KeyValueStore from "../persistence/KeyValueStore.ts"
 import * as Schema from "../Schema.ts"
 import * as Semaphore from "../Semaphore.ts"
 import { JWS } from "./internal/algorithms.ts"
@@ -166,14 +167,32 @@ const isUsable = (jwk: Record<string, unknown>, entry: (typeof JWS)[string], alg
 }
 
 /**
+ * Options for selecting keys from a key set.
+ *
+ * **Details**
+ *
+ * `multipleMatches` controls what happens when several keys match a token,
+ * usually because it has no `kid`. `"fail"` (the default) fails with
+ * {@link MultipleMatchingKeysError}; `"tryEach"` passes every matching key to
+ * verification, which succeeds with the first one whose signature verifies.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface LocalOptions {
+  readonly multipleMatches?: "fail" | "tryEach" | undefined
+}
+
+/**
  * Creates a resolver that selects keys from an in-memory key set.
  *
  * **Details**
  *
  * A key is a candidate when its `kty` and `crv` suit the token's `alg`, its
  * `kid` matches when the token has one, and its `alg`, `use`, and `key_ops`
- * permit verification. Exactly one candidate must match. Imported keys are
- * cached per algorithm.
+ * permit verification. Exactly one candidate must match unless
+ * `multipleMatches` is `"tryEach"`. Imported keys are cached per algorithm.
  *
  * **Gotchas**
  *
@@ -184,7 +203,7 @@ const isUsable = (jwk: Record<string, unknown>, entry: (typeof JWS)[string], alg
  * @category constructors
  * @since 4.0.0
  */
-export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, MalformedKeySetError> =>
+export const makeLocal = (jwks: JwkSet, options?: LocalOptions): Effect.Effect<Resolver, MalformedKeySetError> =>
   Effect.suspend(() => {
     let snapshot: unknown
     try {
@@ -194,7 +213,22 @@ export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, MalformedKeySet
     }
     if (!isJwkSet(snapshot)) return Effect.fail(new MalformedKeySetError({ message: "JSON Web Key Set malformed" }))
     const keys = snapshot.keys as ReadonlyArray<Record<string, unknown>>
+    const tryEach = options?.multipleMatches === "tryEach"
     const cache = new Map<string, Crypto.Key>()
+    const importKey = (index: number, entry: (typeof JWS)[string]) =>
+      Effect.gen(function*() {
+        const cacheKey = `${index}:${entry.alg}`
+        const cached = cache.get(cacheKey)
+        if (cached) return cached
+        const key = yield* JsonWebKey.jwkToKey(entry, keys[index] as Crypto.JwkData, true)
+        if (key.type !== "public") {
+          return yield* Effect.fail(
+            new MalformedKeySetError({ message: "JSON Web Key Set members must be public keys" })
+          )
+        }
+        cache.set(cacheKey, key)
+        return key
+      })
     const resolver: Resolver = (protectedHeader, token) =>
       Effect.gen(function*() {
         const { alg, kid } = { ...protectedHeader, ...token?.header }
@@ -219,25 +253,35 @@ export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, MalformedKeySet
             })
           )
         }
-        if (candidates.length > 1) {
+        if (candidates.length === 1) return yield* importKey(candidates[0], entry)
+        if (!tryEach) {
           return yield* Effect.fail(
             new MultipleMatchingKeysError({ message: "multiple matching keys found in the JSON Web Key Set" })
           )
         }
-        const cacheKey = `${candidates[0]}:${entry.alg}`
-        const cached = cache.get(cacheKey)
-        if (cached) return cached
-        const key = yield* JsonWebKey.jwkToKey(entry, keys[candidates[0]] as Crypto.JwkData, true)
-        if (key.type !== "public") {
-          return yield* Effect.fail(
-            new MalformedKeySetError({ message: "JSON Web Key Set members must be public keys" })
-          )
-        }
-        cache.set(cacheKey, key)
-        return key
+        const imported: Array<Crypto.Key> = []
+        for (const index of candidates) imported.push(yield* importKey(index, entry))
+        return imported as unknown as JsonWebSignature.KeyCandidates
       })
     return Effect.succeed(resolver)
   })
+
+/**
+ * Where a remote key set keeps the last fetched keys.
+ *
+ * **Details**
+ *
+ * - `"memory"` (the default): in this process only.
+ * - `"keyValueStore"`: also in the `KeyValueStore` service, so a restarted
+ *   process (for example a serverless cold start) reuses the last fetch until
+ *   it is older than `cacheMaxAge`. Selecting it adds `KeyValueStore` to the
+ *   requirements and `KeyValueStoreError` to the resolver's errors.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type Storage = "memory" | "keyValueStore"
 
 /**
  * Options for remote key sets.
@@ -250,17 +294,46 @@ export const makeLocal = (jwks: JwkSet): Effect.Effect<Resolver, MalformedKeySet
  *   unknown key (30 seconds by default).
  * - `timeoutDuration`: request timeout (5 seconds by default).
  * - `headers`: additional request headers.
+ * - `storage`: see {@link Storage}.
+ * - `storageKey`: the `KeyValueStore` key (derived from the URL by default).
+ *
+ * To customize how the set is fetched (fetch implementation, retries,
+ * tracing), provide a customized `HttpClient`.
  *
  * @stability unstable
  * @category models
  * @since 4.0.0
  */
-export interface RemoteOptions {
+export interface RemoteOptions extends LocalOptions {
   readonly cacheMaxAge?: Duration.Input | undefined
   readonly cooldownDuration?: Duration.Input | undefined
   readonly timeoutDuration?: Duration.Input | undefined
   readonly headers?: Readonly<Record<string, string>> | undefined
+  readonly storage?: Storage | undefined
+  readonly storageKey?: string | undefined
 }
+
+/**
+ * The services a remote key set requires for the selected storage.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type StorageServices<O> = O extends { readonly storage: "keyValueStore" } ? KeyValueStore.KeyValueStore
+  : never
+
+/**
+ * The additional failures of a remote key set for the selected storage.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type StorageError<O> = O extends { readonly storage: "keyValueStore" } ? KeyValueStore.KeyValueStoreError
+  : never
+
+const StoredKeySet = Schema.fromJsonString(Schema.Struct({ fetchedAt: Schema.Finite, jwks: JwkSet }))
 
 /**
  * Creates a resolver backed by a key set fetched over HTTP.
@@ -270,26 +343,37 @@ export interface RemoteOptions {
  * The set is fetched lazily on first use and refetched once it is older than
  * `cacheMaxAge`. When no key matches and the cooldown has elapsed, the set is
  * refetched and selection is retried once. Concurrent refetches are
- * coalesced.
+ * coalesced. With `"keyValueStore"` storage, a stored set is used on first use
+ * when it is still fresh, and every fetch is written back; a stored value
+ * that cannot be decoded is treated as missing.
  *
  * @stability unstable
  * @category constructors
  * @since 4.0.0
  */
-export const makeRemote = (
+export const makeRemote = <const O extends RemoteOptions = {}>(
   url: string | URL,
-  options?: RemoteOptions
-): Effect.Effect<Resolver<RemoteSelectError>, never, HttpClient.HttpClient> =>
+  options?: O
+): Effect.Effect<
+  Resolver<RemoteSelectError | StorageError<O>>,
+  never,
+  HttpClient.HttpClient | StorageServices<O>
+> =>
   Effect.gen(function*() {
     const client = yield* HttpClient.HttpClient
+    const store = options?.storage === "keyValueStore"
+      ? yield* Effect.service(KeyValueStore.KeyValueStore)
+      : undefined
+    const href = url.toString()
+    const storageKey = options?.storageKey ?? `effect/jose/JsonWebKeySet/${href}`
     const cacheMaxAge = Duration.toMillis(options?.cacheMaxAge ?? Duration.minutes(10))
     const cooldown = Duration.toMillis(options?.cooldownDuration ?? Duration.seconds(30))
     const timeout = options?.timeoutDuration ?? Duration.seconds(5)
+    const localOptions: LocalOptions = { multipleMatches: options?.multipleMatches }
     const lock = yield* Semaphore.make(1)
     let local: Resolver | undefined
     let fetchedAt = -Infinity
 
-    const href = url.toString()
     const fetchSet: Effect.Effect<unknown, KeySetFetchError | KeySetTimeoutError> = client.get(url, {
       headers: { accept: "application/json", ...options?.headers }
     }).pipe(
@@ -314,19 +398,33 @@ export const makeRemote = (
       })
     )
 
-    const reload = (
-      force: boolean
-    ): Effect.Effect<Resolver, MalformedKeySetError | KeySetFetchError | KeySetTimeoutError> =>
+    const loadStored = (now: number) =>
+      Effect.gen(function*() {
+        if (store === undefined) return false
+        const raw = yield* store.get(storageKey)
+        if (raw === undefined) return false
+        const stored = yield* Effect.option(Schema.decodeUnknownEffect(StoredKeySet)(raw))
+        if (stored._tag === "None" || now - stored.value.fetchedAt >= cacheMaxAge) return false
+        const resolver = yield* Effect.option(makeLocal(stored.value.jwks as JwkSet, localOptions))
+        if (resolver._tag === "None") return false
+        local = resolver.value
+        fetchedAt = stored.value.fetchedAt
+        return true
+      })
+
+    const reload = (force: boolean) =>
       lock.withPermit(Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         if (!force && local !== undefined && now - fetchedAt < cacheMaxAge) return local
+        if (!force && local === undefined && (yield* loadStored(now))) return local!
         const json = yield* fetchSet
-        local = yield* makeLocal(json as unknown as JwkSet)
+        local = yield* makeLocal(json as JwkSet, localOptions)
         fetchedAt = yield* Clock.currentTimeMillis
+        if (store !== undefined) yield* store.set(storageKey, JSON.stringify({ fetchedAt, jwks: json }))
         return local
       }))
 
-    const resolver: Resolver<RemoteSelectError> = (protectedHeader, token) =>
+    const resolver: Resolver<RemoteSelectError | KeyValueStore.KeyValueStoreError> = (protectedHeader, token) =>
       Effect.gen(function*() {
         const resolve = yield* reload(false)
         const result = yield* Effect.result(resolve(protectedHeader, token))
@@ -337,5 +435,9 @@ export const makeRemote = (
         const fresh = yield* reload(true)
         return yield* fresh(protectedHeader, token)
       })
-    return resolver
-  })
+    return resolver as Resolver<RemoteSelectError | StorageError<O>>
+  }) as unknown as Effect.Effect<
+    Resolver<RemoteSelectError | StorageError<O>>,
+    never,
+    HttpClient.HttpClient | StorageServices<O>
+  >

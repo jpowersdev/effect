@@ -174,7 +174,23 @@ export type Key = Crypto.Key | Uint8Array | Crypto.JwkData
 export type KeyResolver<E = never, R = never> = (
   protectedHeader: Header | undefined,
   token: Flattened
-) => Effect.Effect<Key, E, R>
+) => Effect.Effect<Key | KeyCandidates, E, R>
+
+/**
+ * Several keys a {@link KeyResolver} returns for verification to try in
+ * order.
+ *
+ * **Details**
+ *
+ * Verification succeeds with the first candidate whose signature verifies.
+ * Resolvers only return candidates when the caller opted into it, for example
+ * with `multipleMatches: "tryEach"` on a key set.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type KeyCandidates = readonly [Key, ...Array<Key>]
 
 /**
  * The result of a successful verification.
@@ -488,15 +504,41 @@ const verifySignature = <E, R>(
       return { entry, data, signature }
     })
     const { entry } = prepared
-    const k = yield* rawKey(yield* prepareKey(entry, resolved, "verify"), entry.key!, "verify")
-    if (entry.minRsaBits) yield* attempt(() => checkModulusLength(entry.alg, k))
     const crypto = yield* cryptoService
-    const verified = yield* Effect.orElseSucceed(
-      crypto.verify(entry.signing, k, prepared.signature, prepared.data),
-      () => false
-    )
-    if (!verified) {
-      return yield* Effect.fail(new SignatureVerificationError({ message: "signature verification failed" }))
+    const verifyWith = (candidate: unknown) =>
+      Effect.gen(function*() {
+        const k = yield* rawKey(yield* prepareKey(entry, candidate, "verify"), entry.key!, "verify")
+        if (entry.minRsaBits) yield* attempt(() => checkModulusLength(entry.alg, k))
+        const verified = yield* Effect.orElseSucceed(
+          crypto.verify(entry.signing, k, prepared.signature, prepared.data),
+          () => false
+        )
+        if (!verified) {
+          return yield* Effect.fail(new SignatureVerificationError({ message: "signature verification failed" }))
+        }
+      })
+    if (!Array.isArray(resolved)) {
+      yield* verifyWith(resolved)
+    } else {
+      // Candidates are tried in order. When none verifies, report a signature
+      // failure if any candidate was usable, otherwise the first key error.
+      let firstError: VerifyError | undefined
+      let attempted = false
+      let verified = false
+      for (const candidate of resolved) {
+        const result = yield* Effect.result(verifyWith(candidate))
+        if (result._tag === "Success") {
+          verified = true
+          break
+        }
+        if (result.failure._tag === "SignatureVerificationError") attempted = true
+        firstError ??= result.failure
+      }
+      if (!verified) {
+        return yield* Effect.fail(
+          attempted ? new SignatureVerificationError({ message: "signature verification failed" }) : firstError!
+        )
+      }
     }
     const payload = typeof checked.signingPayload === "string"
       ? yield* attempt(() => decodeB64u(checked.signingPayload as string, "payload", malformed))
@@ -643,4 +685,36 @@ export const decodeProtectedHeader = (token: string): Effect.Effect<Header, Malf
     if (typeof token !== "string") throw new TypeError("Token must be a string")
     const encoded = token.split(".")[0]
     return parseHeader(encoded, malformed, "Invalid Token or Protected Header formatting") as Header
+  })
+
+/**
+ * Resolves the verification key from the token's own `jwk` protected header
+ * parameter (RFC 7515 section 4.1.3).
+ *
+ * **When to use**
+ *
+ * Use when the signer presents its own public key, as in protocols such as
+ * DPoP proofs, and trust is established separately, for example by comparing
+ * the key's thumbprint with a bound value.
+ *
+ * **Gotchas**
+ *
+ * A valid signature only proves possession of the embedded key, not who owns
+ * it. The `jwk` must be in the protected header, must be a public key, and
+ * cannot be used with symmetric algorithms.
+ *
+ * @stability unstable
+ * @category key resolvers
+ * @since 4.0.0
+ */
+export const embeddedKey: KeyResolver<MalformedJwsError> = (protectedHeader) =>
+  Effect.suspend(() => {
+    const jwk = protectedHeader?.jwk as unknown
+    if (!isObject(jwk)) {
+      return Effect.fail(malformed("\"jwk\" (JSON Web Key) protected Header Parameter must be a JSON object"))
+    }
+    if (jwk.kty === "oct" || jwk.d !== undefined) {
+      return Effect.fail(malformed("\"jwk\" (JSON Web Key) Header Parameter must be a public key"))
+    }
+    return Effect.succeed(jwk as Crypto.JwkData)
   })
