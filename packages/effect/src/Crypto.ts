@@ -12,6 +12,7 @@
  */
 import * as Context from "./Context.ts"
 import * as Effect from "./Effect.ts"
+import * as cryptoKeys from "./internal/cryptoKeys.ts"
 import * as random from "./internal/random.ts"
 import * as Ulid from "./internal/ulid.ts"
 import * as Uuid from "./internal/uuid.ts"
@@ -40,6 +41,396 @@ const TypeId = "~effect/Crypto"
  * @since 4.0.0
  */
 export type DigestAlgorithm = "SHA-1" | "SHA-256" | "SHA-384" | "SHA-512"
+
+/**
+ * Operations a cryptographic key may be used for.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type KeyUsage =
+  | "encrypt"
+  | "decrypt"
+  | "sign"
+  | "verify"
+  | "deriveKey"
+  | "deriveBits"
+  | "wrapKey"
+  | "unwrapKey"
+
+/**
+ * Binary key encodings accepted by key import, export, and wrapping
+ * operations.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type BinaryKeyFormat = "raw" | "pkcs8" | "spki"
+
+/**
+ * JSON Web Key data accepted and produced by key import and export.
+ *
+ * **Details**
+ *
+ * This is the structural JWK shape understood by platform cryptography. Use
+ * `effect/jose` for validated JWK schemas.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JwkData {
+  readonly kty: string
+  readonly [parameter: string]: unknown
+}
+
+/**
+ * Elliptic curves supported by ECDSA and ECDH keys.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type NamedCurve = "P-256" | "P-384" | "P-521"
+
+/**
+ * Algorithms used to import or generate keys.
+ *
+ * **Details**
+ *
+ * `length` is in bits. For HMAC it defaults to the block size of `hash`; for
+ * AES it is required when generating and inferred from the key when importing.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type KeyAlgorithm =
+  | { readonly name: "HMAC"; readonly hash: DigestAlgorithm; readonly length?: number | undefined }
+  | {
+    readonly name: "RSASSA-PKCS1-v1_5" | "RSA-PSS" | "RSA-OAEP"
+    readonly hash: DigestAlgorithm
+    readonly modulusLength?: number | undefined
+    readonly publicExponent?: Uint8Array | undefined
+  }
+  | { readonly name: "ECDSA" | "ECDH"; readonly namedCurve: NamedCurve }
+  | { readonly name: "Ed25519" | "X25519" }
+  | { readonly name: "AES-GCM" | "AES-CBC" | "AES-CTR" | "AES-KW"; readonly length?: number | undefined }
+  | { readonly name: "HKDF" | "PBKDF2" }
+
+/**
+ * Normalized description of the algorithm a key is bound to.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyAlgorithmInfo {
+  readonly name: string
+  readonly hash?: DigestAlgorithm | undefined
+  readonly namedCurve?: string | undefined
+  readonly length?: number | undefined
+  readonly modulusLength?: number | undefined
+}
+
+/**
+ * Opaque handle to a key held by a `Crypto` implementation.
+ *
+ * **Details**
+ *
+ * Key material is not exposed directly. Use `exportKey` on an extractable key
+ * to read its encoded form.
+ *
+ * **Gotchas**
+ *
+ * Keys are bound to the `Crypto` implementation that created them. Passing a
+ * key to a different implementation fails with `PlatformError`.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface Key {
+  readonly type: "secret" | "public" | "private"
+  readonly algorithm: KeyAlgorithmInfo
+  readonly extractable: boolean
+  readonly usages: ReadonlyArray<KeyUsage>
+}
+
+/**
+ * Public and private keys produced by asymmetric key generation.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyPair {
+  readonly publicKey: Key
+  readonly privateKey: Key
+}
+
+/**
+ * Options controlling the capabilities of an imported, generated, or
+ * unwrapped key.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyOptions {
+  readonly extractable?: boolean | undefined
+  readonly usages: ReadonlyArray<KeyUsage>
+}
+
+/**
+ * Algorithms used to sign and verify data.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type SignAlgorithm =
+  | { readonly name: "HMAC" }
+  | { readonly name: "RSASSA-PKCS1-v1_5" }
+  | { readonly name: "RSA-PSS"; readonly saltLength: number }
+  | { readonly name: "ECDSA"; readonly hash: DigestAlgorithm }
+  | { readonly name: "Ed25519" }
+
+/**
+ * Algorithms used to encrypt and decrypt data.
+ *
+ * **Details**
+ *
+ * For AES-GCM, `tagLength` is in bits and defaults to 128. The authentication
+ * tag is appended to the ciphertext.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type CipherAlgorithm =
+  | {
+    readonly name: "AES-GCM"
+    readonly iv: Uint8Array
+    readonly additionalData?: Uint8Array | undefined
+    readonly tagLength?: number | undefined
+  }
+  | { readonly name: "AES-CBC"; readonly iv: Uint8Array }
+  | { readonly name: "AES-CTR"; readonly counter: Uint8Array; readonly length: number }
+  | { readonly name: "RSA-OAEP"; readonly label?: Uint8Array | undefined }
+
+/**
+ * Algorithms used to derive bits from a base key.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type DeriveAlgorithm =
+  | { readonly name: "ECDH" | "X25519"; readonly public: Key }
+  | {
+    readonly name: "HKDF"
+    readonly hash: DigestAlgorithm
+    readonly salt: Uint8Array
+    readonly info: Uint8Array
+  }
+  | {
+    readonly name: "PBKDF2"
+    readonly hash: DigestAlgorithm
+    readonly salt: Uint8Array
+    readonly iterations: number
+  }
+
+/**
+ * Algorithms used to wrap and unwrap keys.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export type WrapAlgorithm = { readonly name: "AES-KW" } | CipherAlgorithm
+
+/**
+ * Key-based cryptographic operations provided by a `Crypto` implementation.
+ *
+ * **When to use**
+ *
+ * Use to supply key operations to `make` when implementing a `Crypto` service.
+ * Most platforms can use `makeKeyOperations` with their Web Crypto
+ * `SubtleCrypto` object.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface KeyOperations {
+  /**
+   * Imports binary key material.
+   */
+  importKey(
+    format: BinaryKeyFormat,
+    keyData: Uint8Array,
+    algorithm: KeyAlgorithm,
+    options: KeyOptions
+  ): Effect.Effect<Key, PlatformError.PlatformError>
+  /**
+   * Imports a JSON Web Key.
+   */
+  importKey(
+    format: "jwk",
+    keyData: JwkData,
+    algorithm: KeyAlgorithm,
+    options: KeyOptions
+  ): Effect.Effect<Key, PlatformError.PlatformError>
+
+  /**
+   * Exports an extractable key in a binary encoding.
+   */
+  exportKey(format: BinaryKeyFormat, key: Key): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+  /**
+   * Exports an extractable key as a JSON Web Key.
+   */
+  exportKey(format: "jwk", key: Key): Effect.Effect<JwkData, PlatformError.PlatformError>
+
+  /**
+   * Generates a key, or a key pair for asymmetric algorithms.
+   */
+  generateKey(algorithm: KeyAlgorithm, options: KeyOptions): Effect.Effect<Key | KeyPair, PlatformError.PlatformError>
+
+  /**
+   * Computes a signature or MAC over `data`.
+   */
+  sign(algorithm: SignAlgorithm, key: Key, data: Uint8Array): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+
+  /**
+   * Checks a signature or MAC over `data`.
+   */
+  verify(
+    algorithm: SignAlgorithm,
+    key: Key,
+    signature: Uint8Array,
+    data: Uint8Array
+  ): Effect.Effect<boolean, PlatformError.PlatformError>
+
+  /**
+   * Encrypts `data`.
+   */
+  encrypt(algorithm: CipherAlgorithm, key: Key, data: Uint8Array): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+
+  /**
+   * Decrypts `data`, failing when authentication or padding checks fail.
+   */
+  decrypt(algorithm: CipherAlgorithm, key: Key, data: Uint8Array): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+
+  /**
+   * Derives `length` bits from a base key.
+   */
+  deriveBits(
+    algorithm: DeriveAlgorithm,
+    baseKey: Key,
+    length: number
+  ): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+
+  /**
+   * Encrypts an extractable key with a wrapping key.
+   */
+  wrapKey(
+    format: BinaryKeyFormat,
+    key: Key,
+    wrappingKey: Key,
+    algorithm: WrapAlgorithm
+  ): Effect.Effect<Uint8Array, PlatformError.PlatformError>
+
+  /**
+   * Decrypts a wrapped key and imports it.
+   */
+  unwrapKey(
+    format: BinaryKeyFormat,
+    wrappedKey: Uint8Array,
+    unwrappingKey: Key,
+    algorithm: WrapAlgorithm,
+    keyAlgorithm: KeyAlgorithm,
+    options: KeyOptions
+  ): Effect.Effect<Key, PlatformError.PlatformError>
+}
+
+/**
+ * Structural subset of the Web Crypto `SubtleCrypto` interface accepted by
+ * `makeKeyOperations`.
+ *
+ * **Details**
+ *
+ * Declared structurally so the core package does not depend on DOM or Node
+ * type libraries. `globalThis.crypto.subtle` satisfies this interface in
+ * browsers, Deno, Bun, and Node.js.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface SubtleCryptoLike {
+  importKey(format: string, keyData: any, algorithm: any, extractable: boolean, usages: Array<any>): Promise<any>
+  exportKey(format: string, key: any): Promise<any>
+  generateKey(algorithm: any, extractable: boolean, usages: Array<any>): Promise<any>
+  sign(algorithm: any, key: any, data: any): Promise<ArrayBuffer>
+  verify(algorithm: any, key: any, signature: any, data: any): Promise<boolean>
+  encrypt(algorithm: any, key: any, data: any): Promise<ArrayBuffer>
+  decrypt(algorithm: any, key: any, data: any): Promise<ArrayBuffer>
+  deriveBits(algorithm: any, baseKey: any, length: number): Promise<ArrayBuffer>
+  wrapKey(format: string, key: any, wrappingKey: any, algorithm: any): Promise<ArrayBuffer>
+  unwrapKey(
+    format: string,
+    wrappedKey: any,
+    unwrappingKey: any,
+    unwrapAlgorithm: any,
+    unwrappedKeyAlgorithm: any,
+    extractable: boolean,
+    usages: Array<any>
+  ): Promise<any>
+}
+
+/**
+ * Creates key operations backed by a Web Crypto `SubtleCrypto` object.
+ *
+ * **When to use**
+ *
+ * Use when implementing a `Crypto` service for a runtime that exposes the Web
+ * Crypto API, passing the result as the `keys` option of `make`.
+ *
+ * **Details**
+ *
+ * Keys returned by these operations wrap native `CryptoKey` values and can only
+ * be used with operations created by the same call.
+ *
+ * **Example** (Creating key operations from Web Crypto)
+ *
+ * ```ts import.meta.vitest
+ * import { Crypto, Effect } from "effect"
+ *
+ * const crypto = Crypto.make({
+ *   randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
+ *   digest: (_algorithm, data) => Effect.succeed(data),
+ *   keys: Crypto.makeKeyOperations(globalThis.crypto.subtle)
+ * })
+ *
+ * const program = Effect.gen(function*() {
+ *   const key = yield* crypto.importKey("raw", new Uint8Array(32), { name: "HMAC", hash: "SHA-256" }, {
+ *     usages: ["sign"]
+ *   })
+ *   const mac = yield* crypto.sign({ name: "HMAC" }, key, new Uint8Array([1, 2, 3]))
+ *   return mac.length
+ * })
+ *
+ * await Effect.runPromise(program) // => 32
+ * ```
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const makeKeyOperations: (subtle: SubtleCryptoLike) => KeyOperations = cryptoKeys.makeKeyOperations
 
 /**
  * Platform-agnostic cryptographic operations.
@@ -78,7 +469,7 @@ export type DigestAlgorithm = "SHA-1" | "SHA-256" | "SHA-384" | "SHA-512"
  * @category services
  * @since 4.0.0
  */
-export interface Crypto {
+export interface Crypto extends KeyOperations {
   readonly [TypeId]: typeof TypeId
 
   /**
@@ -235,7 +626,8 @@ export const Crypto: Context.Service<Crypto, Crypto> = Context.Service("effect/C
  *
  * The constructor derives random numbers, booleans, integer ranges, shuffling,
  * and UUID generation from `impl.randomBytes`. Digest operations delegate to
- * `impl.digest`.
+ * `impl.digest`. Key operations delegate to `impl.keys`; when it is omitted,
+ * every key operation fails with `PlatformError`.
  *
  * **Gotchas**
  *
@@ -267,6 +659,7 @@ export const make = (
       algorithm: DigestAlgorithm,
       data: Uint8Array
     ) => Effect.Effect<Uint8Array, PlatformError.PlatformError>
+    readonly keys?: KeyOperations | undefined
   }
 ): Crypto => {
   const randomBytesUnsafe = impl.randomBytes
@@ -292,8 +685,20 @@ export const make = (
     }
   }
 
+  const keys = impl.keys ?? cryptoKeys.unsupportedKeyOperations
+
   return Crypto.of({
     [TypeId]: TypeId,
+    importKey: keys.importKey,
+    exportKey: keys.exportKey,
+    generateKey: keys.generateKey,
+    sign: keys.sign,
+    verify: keys.verify,
+    encrypt: keys.encrypt,
+    decrypt: keys.decrypt,
+    deriveBits: keys.deriveBits,
+    wrapKey: keys.wrapKey,
+    unwrapKey: keys.unwrapKey,
     randomBytes,
     nextDoubleUnsafe,
     nextIntUnsafe,

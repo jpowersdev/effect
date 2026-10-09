@@ -50,7 +50,8 @@ const digest: EffectCrypto.Crypto["digest"] = (algorithm, data) =>
  */
 export const make: EffectCrypto.Crypto = EffectCrypto.make({
   randomBytes: NodeCrypto.randomBytes,
-  digest
+  digest,
+  keys: EffectCrypto.makeKeyOperations(NodeCrypto.webcrypto.subtle)
 })
 
 /**

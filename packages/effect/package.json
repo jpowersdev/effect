@@ -41,6 +41,7 @@
     "./eventlog": "./src/eventlog/index.ts",
     "./http": "./src/http/index.ts",
     "./http-api": "./src/http-api/index.ts",
+    "./jose": "./src/jose/index.ts",
     "./net": "./src/net/index.ts",
     "./observability": "./src/observability/index.ts",
     "./persistence": "./src/persistence/index.ts",
@@ -55,6 +56,7 @@
     "./*": "./src/*.ts",
     "./cli/internal/*": null,
     "./cluster/internal/*": null,
+    "./jose/internal/*": null,
     "./internal/*": null,
     "./index": null,
     "./*/index": null
@@ -84,6 +86,7 @@
       "./eventlog": "./dist/eventlog/index.js",
       "./http": "./dist/http/index.js",
       "./http-api": "./dist/http-api/index.js",
+      "./jose": "./dist/jose/index.js",
       "./net": "./dist/net/index.js",
       "./observability": "./dist/observability/index.js",
       "./persistence": "./dist/persistence/index.js",
@@ -99,6 +102,7 @@
       "./internal/*": null,
       "./cli/internal/*": null,
       "./cluster/internal/*": null,
+      "./jose/internal/*": null,
       "./index": null,
       "./*/index": null
     }

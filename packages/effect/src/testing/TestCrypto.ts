@@ -3,8 +3,8 @@
  * tests.
  *
  * Random bytes, numbers, shuffles, UUIDs, and ULIDs are derived from a seeded
- * pseudo-random generator. Digest operations are delegated to an underlying
- * platform `Crypto` service.
+ * pseudo-random generator. Digest and key operations are delegated to an
+ * underlying platform `Crypto` service.
  *
  * @stability unstable
  * @since 4.0.0
@@ -58,7 +58,8 @@ export const make: (
         }
         return bytes
       },
-      digest: crypto.digest
+      digest: crypto.digest,
+      keys: crypto
     })
   },
   (effect, seed) => Random.withSeed(effect, seed)

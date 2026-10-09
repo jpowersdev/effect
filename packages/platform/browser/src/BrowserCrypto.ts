@@ -96,7 +96,8 @@ export const layer: Layer.Layer<EffectCrypto.Crypto> = Layer.effect(
 
     return EffectCrypto.make({
       randomBytes,
-      digest
+      digest,
+      ...(crypto.subtle !== undefined ? { keys: EffectCrypto.makeKeyOperations(crypto.subtle) } : {})
     })
   })
 )
