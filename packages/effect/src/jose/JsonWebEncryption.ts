@@ -245,7 +245,8 @@ const checkEncryptHeaders = (options: Omit<EncryptOptions, "key">): Checked => {
 const encryptJwe = (
   plaintext: Uint8Array,
   checked: Checked,
-  options: EncryptOptions
+  options: EncryptOptions,
+  unprotectedParameters = false
 ): Effect.Effect<Flattened, JoseError, Crypto.Crypto> =>
   Effect.gen(function*() {
     let { protectedHeader, unprotectedHeader } = checked
@@ -258,7 +259,10 @@ const encryptJwe = (
       options.keyManagementParameters
     )
     if (parameters) {
-      protectedHeader = protectedHeader ? { ...protectedHeader, ...parameters } : parameters
+      // With several recipients, per-recipient key management parameters
+      // belong in that recipient's unprotected header.
+      if (unprotectedParameters) unprotectedHeader = unprotectedHeader ? { ...unprotectedHeader, ...parameters } : parameters
+      else protectedHeader = protectedHeader ? { ...protectedHeader, ...parameters } : parameters
       yield* attempt(() => checkDisjoint(protectedHeader, unprotectedHeader, checked.sharedUnprotectedHeader))
     }
     const protectedString = protectedHeader ? b64u(JSON.stringify(protectedHeader)) : ""
@@ -401,7 +405,7 @@ export const encryptGeneral = (
       cek,
       keyManagementParameters: recipients[0].keyManagementParameters,
       crit: recipients[0].crit
-    })
+    }, multiple)
     const out: Array<{ header?: Header; encrypted_key?: string }> = [{}]
     if (encrypted_key) out[0].encrypted_key = encrypted_key
     if (header) out[0].header = header

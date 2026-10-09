@@ -302,9 +302,16 @@ export const encryptKeyManagement = (
         const apv = provided.apv ?? (yield* attempt(() => partyInfo(joseHeader, "apv")))
         yield* attempt(() => checkPartyInfo(apu, apv))
         let ephemeralPrivate: Crypto.Key
-        let ephemeralPublic: Crypto.Key | undefined
+        let ephemeralPublic: Crypto.Key | Crypto.JwkData | undefined
         if (provided.epk !== undefined) {
           ephemeralPrivate = (yield* prepareKey(entry, provided.epk, "decrypt")) as Crypto.Key
+          if (isObject(provided.epk)) {
+            // A private JWK already carries its public members, so the public
+            // key does not need to be exported from the imported handle.
+            ephemeralPublic = provided.epk as Crypto.JwkData
+          } else if (!ephemeralPrivate.extractable) {
+            return yield* fail("InvalidKey", "Key for \"epk\" must be extractable")
+          }
         } else {
           const algorithm: Crypto.KeyAlgorithm = recipient.algorithm.name === "X25519"
             ? { name: "X25519" }
@@ -315,7 +322,9 @@ export const encryptKeyManagement = (
           ephemeralPrivate = pair.privateKey
           ephemeralPublic = pair.publicKey
         }
-        const exported = yield* mapCryptoError(crypto.exportKey("jwk", ephemeralPublic ?? ephemeralPrivate))
+        const exported = ephemeralPublic !== undefined && !isCryptoKey(ephemeralPublic)
+          ? ephemeralPublic
+          : yield* mapCryptoError(crypto.exportKey("jwk", ephemeralPublic ?? ephemeralPrivate))
         const direct = entry.mode === "direct-key-agreement"
         const shared = yield* ecdhesDerive(
           recipient,
