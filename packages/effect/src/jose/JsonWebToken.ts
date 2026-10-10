@@ -419,7 +419,7 @@ const sign = (
     const encoded = options.schema === undefined ? claims as Claims : yield* encodeWith(options.schema, claims)
     const now = yield* Clock.currentTimeMillis
     const payload = yield* attemptWith<ClaimValidationError>()(() => buildClaims(encoded, options, now))
-    const token = yield* JsonWebSignature.signCompact(
+    const token = yield* JsonWebSignature.signCompactInternal(
       payload,
       { key: options.key, protectedHeader: options.protectedHeader, crit: options.crit },
       rejectUnencoded
@@ -606,7 +606,7 @@ const encrypt = (
     if (options.replicateIssuerAsHeader) protectedHeader.iss = payload.iss
     if (options.replicateSubjectAsHeader) protectedHeader.sub = payload.sub
     if (options.replicateAudienceAsHeader) protectedHeader.aud = payload.aud
-    const token = yield* JsonWebEncryption.encryptCompact(bytes, {
+    const token = yield* JsonWebEncryption.encryptCompactInternal(bytes, {
       ...options,
       protectedHeader: protectedHeader as JsonWebEncryption.Header
     })
@@ -628,7 +628,7 @@ const decrypt = <E, R>(
   options?: DecryptOptions & { readonly schema?: Schema.Constraint }
 ): Effect.Effect<Result<any>, DecryptError | E, any> =>
   Effect.gen(function*() {
-    const decrypted = yield* JsonWebEncryption.decryptCompact(token, key, options)
+    const decrypted = yield* JsonWebEncryption.decryptCompactInternal(token, key, options)
     const now = yield* Clock.currentTimeMillis
     const protectedHeader = decrypted.protectedHeader as Record<string, unknown>
     const claims = yield* attemptClaims(() => {

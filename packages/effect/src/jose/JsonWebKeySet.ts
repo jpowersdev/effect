@@ -656,8 +656,8 @@ export const make: Effect.Effect<JsonWebKeySet, never, Crypto.Crypto> = Effect.m
  * const program = Effect.gen(function*() {
  *   const keySets = yield* JsonWebKeySet.JsonWebKeySet
  *   const jwt = yield* JsonWebToken.JsonWebToken
- *   const keys = yield* keySets.makeRemote("https://auth.example.com/.well-known/jwks.json")
- *   const { payload } = yield* jwt.verify(token, keys, {
+ *   const keySet = yield* keySets.makeRemote("https://auth.example.com/.well-known/jwks.json")
+ *   const { payload } = yield* jwt.verify(token, keySet, {
  *     algorithms: ["ES256"],
  *     issuer: "https://auth.example.com"
  *   })

@@ -492,7 +492,7 @@ const createSignature = Effect.fnUntraced(function*(
 })
 
 /** @internal */
-export const signCompact = (
+export const signCompactInternal = (
   payload: Uint8Array | string,
   options: Omit<SignOptions, "unprotectedHeader"> & { readonly protectedHeader: Header },
   rejectUnencoded?: () => void
@@ -936,7 +936,7 @@ export const make: Effect.Effect<JsonWebSignature, never, Crypto.Crypto> = Effec
   (crypto) => {
     const provide = provideCrypto(crypto)
     return JsonWebSignature.of({
-      signCompact: provide(signCompact),
+      signCompact: provide(signCompactInternal),
       signFlattened: provide(signFlattened),
       signGeneral: provide(signGeneral),
       verifyCompact: provide(verifyCompact),

@@ -946,7 +946,7 @@ const encryptFlattened = (
   )
 
 /** @internal */
-export const encryptCompact = (
+export const encryptCompactInternal = (
   plaintext: Uint8Array | string,
   options: Omit<EncryptOptions, "unprotectedHeader" | "sharedUnprotectedHeader" | "additionalAuthenticatedData"> & {
     readonly protectedHeader: Header
@@ -1199,7 +1199,7 @@ const decryptJwe = <E, R>(
   })
 
 /** @internal */
-export const decryptCompact = <E = never, R = never>(
+export const decryptCompactInternal = <E = never, R = never>(
   jwe: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: DecryptOptions
@@ -1386,10 +1386,10 @@ export const make: Effect.Effect<JsonWebEncryption, never, Crypto.Crypto> = Effe
   (crypto) => {
     const provide = provideCrypto(crypto)
     return JsonWebEncryption.of({
-      encryptCompact: provide(encryptCompact),
+      encryptCompact: provide(encryptCompactInternal),
       encryptFlattened: provide(encryptFlattened),
       encryptGeneral: provide(encryptGeneral),
-      decryptCompact: provide(decryptCompact),
+      decryptCompact: provide(decryptCompactInternal),
       decryptFlattened: provide(decryptFlattened),
       decryptGeneral: provide(decryptGeneral)
     })
