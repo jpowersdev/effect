@@ -1,5 +1,6 @@
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import { JsonWebEncryption, JsonWebKey, JsonWebKeySet, JsonWebSignature, JsonWebToken } from "effect/jose"
 import * as Layer from "effect/Layer"
 
 export const WebCrypto = Crypto.make({
@@ -12,6 +13,14 @@ export const WebCrypto = Crypto.make({
 })
 
 export const CryptoLive = Layer.succeed(Crypto.Crypto, WebCrypto)
+
+export const JoseLive = Layer.mergeAll(
+  JsonWebKey.layer,
+  JsonWebSignature.layer,
+  JsonWebEncryption.layer,
+  JsonWebToken.layer,
+  JsonWebKeySet.layer
+).pipe(Layer.provide(CryptoLive))
 
 export const utf8 = (input: string) => new TextEncoder().encode(input)
 export const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes)

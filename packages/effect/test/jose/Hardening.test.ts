@@ -7,7 +7,7 @@ import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
-import { CryptoLive, text, utf8 } from "./utils.ts"
+import { JoseLive, text, utf8 } from "./utils.ts"
 
 const secret = utf8("a-string-secret-at-least-256-bits-long")
 
@@ -26,6 +26,7 @@ const serving = (body: unknown, options?: { readonly url?: string }) =>
 describe("remote key set hardening", () => {
   it.effect("rejects insecure or ambiguous URLs before fetching", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
       for (
         const url of [
           "http://issuer.example/jwks",
@@ -34,17 +35,19 @@ describe("remote key set hardening", () => {
           "not a url"
         ]
       ) {
-        const error = yield* Effect.flip(JsonWebKeySet.makeRemote(url))
+        const error = yield* Effect.flip(keySets.makeRemote(url))
         assert.strictEqual(error._tag, "InvalidKeySetUrlError", url)
       }
-      yield* JsonWebKeySet.makeRemote("http://localhost:8080/jwks", { allowInsecureHttp: true })
-      yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks")
-    }).pipe(Effect.provide(serving({ keys: [] }))))
+      yield* keySets.makeRemote("http://localhost:8080/jwks", { allowInsecureHttp: true })
+      yield* keySets.makeRemote("https://issuer.example/jwks")
+    }).pipe(Effect.provide([JoseLive, serving({ keys: [] })])))
 
   const tokenFor = Effect.gen(function*() {
-    const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-    const jwk = { ...(yield* JsonWebKey.exportJwk(publicKey)), kid: "k" }
-    const token = yield* JsonWebSignature.signCompact("x", {
+    const keys = yield* JsonWebKey.JsonWebKey
+    const jws = yield* JsonWebSignature.JsonWebSignature
+    const { privateKey, publicKey } = yield* keys.generateKeyPair("ES256", { extractable: true })
+    const jwk = { ...(yield* keys.exportJwk(publicKey)), kid: "k" }
+    const token = yield* jws.signCompact("x", {
       key: privateKey,
       protectedHeader: { alg: "ES256", kid: "k" }
     })
@@ -53,23 +56,27 @@ describe("remote key set hardening", () => {
 
   it.effect("refuses responses from a different URL (redirects)", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { jwk, token } = yield* tokenFor
       const error = yield* Effect.flip(
         Effect.flatMap(
-          JsonWebKeySet.makeRemote("https://issuer.example/jwks"),
-          (resolver) => JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
+          keySets.makeRemote("https://issuer.example/jwks"),
+          (resolver) => jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
         ).pipe(Effect.provide(serving({ keys: [jwk] }, { url: "https://attacker.example/jwks" })))
       )
       assert.strictEqual(error._tag, "KeySetFetchError")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("caps the response size and the number of keys", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { jwk, token } = yield* tokenFor
       const verifyWith = (body: unknown, options: JsonWebKeySet.RemoteOptions) =>
         Effect.flatMap(
-          JsonWebKeySet.makeRemote("https://issuer.example/jwks", options),
-          (resolver) => JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
+          keySets.makeRemote("https://issuer.example/jwks", options),
+          (resolver) => jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
         ).pipe(Effect.provide(serving(body)))
       const padded = { keys: [jwk], padding: "x".repeat(200_000) }
       const big = yield* Effect.flip(verifyWith(padded, {}))
@@ -78,46 +85,52 @@ describe("remote key set hardening", () => {
       assert.strictEqual(many._tag, "KeySetTooLargeError")
       // Raising the limit accepts the same response.
       yield* verifyWith(padded, { maxResponseBytes: 300_000 })
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("token size limits", () => {
   it.effect("rejects oversized compact tokens before parsing, with an override", () =>
     Effect.gen(function*() {
-      const jws = Redacted.value(
-        yield* JsonWebSignature.signCompact("x".repeat(70_000), { key: secret, protectedHeader: { alg: "HS256" } })
+      const jws = yield* JsonWebSignature.JsonWebSignature
+      const jwe = yield* JsonWebEncryption.JsonWebEncryption
+      const jwt = yield* JsonWebToken.JsonWebToken
+      const token = Redacted.value(
+        yield* jws.signCompact("x".repeat(70_000), { key: secret, protectedHeader: { alg: "HS256" } })
       )
-      const tooLarge = yield* Effect.flip(JsonWebSignature.verifyCompact(jws, secret, { algorithms: ["HS256"] }))
+      const tooLarge = yield* Effect.flip(jws.verifyCompact(token, secret, { algorithms: ["HS256"] }))
       assert.strictEqual(tooLarge._tag, "JwsTooLargeError")
-      yield* JsonWebSignature.verifyCompact(jws, secret, { algorithms: ["HS256"], maxTokenLength: 200_000 })
-      const jwtTooLarge = yield* Effect.flip(JsonWebToken.verify("a".repeat(70_000), secret, { algorithms: ["HS256"] }))
+      yield* jws.verifyCompact(token, secret, { algorithms: ["HS256"], maxTokenLength: 200_000 })
+      const jwtTooLarge = yield* Effect.flip(jwt.verify("a".repeat(70_000), secret, { algorithms: ["HS256"] }))
       assert.strictEqual(jwtTooLarge._tag, "JwsTooLargeError")
-      const jweTooLarge = yield* Effect.flip(JsonWebEncryption.decryptCompact("a".repeat(70_000), secret))
+      const jweTooLarge = yield* Effect.flip(jwe.decryptCompact("a".repeat(70_000), secret))
       assert.strictEqual(jweTooLarge._tag, "JweTooLargeError")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("minimum HMAC key length (RFC 7518 section 3.2)", () => {
   it.effect("requires keys at least as long as the hash", () =>
     Effect.gen(function*() {
+      const jws = yield* JsonWebSignature.JsonWebSignature
       for (const [alg, bytes] of [["HS256", 32], ["HS384", 48], ["HS512", 64]] as const) {
         const short = yield* Effect.flip(
-          JsonWebSignature.signCompact("x", { key: new Uint8Array(bytes - 1), protectedHeader: { alg } })
+          jws.signCompact("x", { key: new Uint8Array(bytes - 1), protectedHeader: { alg } })
         )
         assert.strictEqual(short._tag, "InvalidKeyError", alg)
-        const token = yield* JsonWebSignature.signCompact("x", { key: new Uint8Array(bytes), protectedHeader: { alg } })
+        const token = yield* jws.signCompact("x", { key: new Uint8Array(bytes), protectedHeader: { alg } })
         const verifyShort = yield* Effect.flip(
-          JsonWebSignature.verifyCompact(token, new Uint8Array(bytes - 1), { algorithms: [alg] })
+          jws.verifyCompact(token, new Uint8Array(bytes - 1), { algorithms: [alg] })
         )
         assert.strictEqual(verifyShort._tag, "InvalidKeyError", alg)
       }
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("Redacted and branded tokens", () => {
   it.effect("returns tokens Redacted and branded, and accepts Redacted tokens and keys", () =>
     Effect.gen(function*() {
-      const token = yield* JsonWebToken.sign({ sub: "u" }, {
+      const jwe = yield* JsonWebEncryption.JsonWebEncryption
+      const jwt = yield* JsonWebToken.JsonWebToken
+      const token = yield* jwt.sign({ sub: "u" }, {
         key: Redacted.make(secret),
         expirationTime: "1 hour",
         protectedHeader: { alg: "HS256" }
@@ -128,31 +141,32 @@ describe("Redacted and branded tokens", () => {
         Redacted.value(token),
         yield* Schema.decodeUnknownEffect(JsonWebToken.Signed)(Redacted.value(token))
       )
-      const { payload } = yield* JsonWebToken.verify(token, Redacted.make(secret), { algorithms: ["HS256"] })
+      const { payload } = yield* jwt.verify(token, Redacted.make(secret), { algorithms: ["HS256"] })
       assert.strictEqual(payload.sub, "u")
       const header = yield* JsonWebSignature.decodeProtectedHeader(token)
       assert.strictEqual(header.alg, "HS256")
-      const jwe = yield* JsonWebEncryption.encryptCompact("x", {
+      const encrypted = yield* jwe.encryptCompact("x", {
         key: new Uint8Array(32),
         protectedHeader: { alg: "dir", enc: "A256GCM" }
       })
-      yield* Schema.decodeUnknownEffect(JsonWebEncryption.Compact)(Redacted.value(jwe))
-      const { plaintext } = yield* JsonWebEncryption.decryptCompact(jwe, new Uint8Array(32))
+      yield* Schema.decodeUnknownEffect(JsonWebEncryption.Compact)(Redacted.value(encrypted))
+      const { plaintext } = yield* jwe.decryptCompact(encrypted, new Uint8Array(32))
       assert.strictEqual(text(plaintext), "x")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("schema errors do not include the claims", () =>
     Effect.gen(function*() {
+      const jwt = yield* JsonWebToken.JsonWebToken
       const Claims = Schema.Struct({ role: Schema.Literals(["admin"]) })
-      const token = yield* JsonWebToken.sign({ role: "top-secret-value" }, {
+      const token = yield* jwt.sign({ role: "top-secret-value" }, {
         key: secret,
         expirationTime: "1 hour",
         protectedHeader: { alg: "HS256" }
       })
-      const error = yield* Effect.flip(JsonWebToken.verify(token, secret, { algorithms: ["HS256"], schema: Claims }))
+      const error = yield* Effect.flip(jwt.verify(token, secret, { algorithms: ["HS256"], schema: Claims }))
       assert.strictEqual(error._tag, "ClaimValidationError")
       assert.notInclude(String((error as any).cause), "top-secret-value")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("claims schema on signing", () => {
@@ -163,7 +177,8 @@ describe("claims schema on signing", () => {
 
   it.effect("encodes typed claims with the schema and decodes them back", () =>
     Effect.gen(function*() {
-      const token = yield* JsonWebToken.sign({ sub: "u", level: 3 }, {
+      const jwt = yield* JsonWebToken.JsonWebToken
+      const token = yield* jwt.sign({ sub: "u", level: 3 }, {
         key: secret,
         expirationTime: "1 hour",
         protectedHeader: { alg: "HS256" },
@@ -171,14 +186,15 @@ describe("claims schema on signing", () => {
       })
       const wire = yield* JsonWebToken.decodeUnverified(token)
       assert.strictEqual(wire.level, "3")
-      const { payload } = yield* JsonWebToken.verify(token, secret, { algorithms: ["HS256"], schema: Claims })
+      const { payload } = yield* jwt.verify(token, secret, { algorithms: ["HS256"], schema: Claims })
       assert.strictEqual(payload.level, 3)
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("rejects claims that do not match the schema", () =>
     Effect.gen(function*() {
+      const jwt = yield* JsonWebToken.JsonWebToken
       const error = yield* Effect.flip(
-        JsonWebToken.sign({ sub: 1 as unknown as string, level: 3 }, {
+        jwt.sign({ sub: 1 as unknown as string, level: 3 }, {
           key: secret,
           expirationTime: "1 hour",
           protectedHeader: { alg: "HS256" },
@@ -186,55 +202,62 @@ describe("claims schema on signing", () => {
         })
       )
       assert.strictEqual(error._tag, "ClaimValidationError")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("expiration required by default", () => {
   it.effect("verify rejects tokens without exp unless requireExpiration is false", () =>
     Effect.gen(function*() {
-      const token = yield* JsonWebToken.sign({ sub: "u" }, {
+      const jwt = yield* JsonWebToken.JsonWebToken
+      const token = yield* jwt.sign({ sub: "u" }, {
         key: secret,
         protectedHeader: { alg: "HS256" },
         requireExpiration: false
       })
-      const error = yield* Effect.flip(JsonWebToken.verify(token, secret, { algorithms: ["HS256"] }))
+      const error = yield* Effect.flip(jwt.verify(token, secret, { algorithms: ["HS256"] }))
       assert(error._tag === "ClaimValidationError")
       assert.strictEqual(error.claim, "exp")
       assert.strictEqual(error.check, "missing")
-      yield* JsonWebToken.verify(token, secret, { algorithms: ["HS256"], requireExpiration: false })
-    }).pipe(Effect.provide(CryptoLive)))
+      yield* jwt.verify(token, secret, { algorithms: ["HS256"], requireExpiration: false })
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("sign requires an expiration unless requireExpiration is false", () =>
     Effect.gen(function*() {
+      const jwt = yield* JsonWebToken.JsonWebToken
       const error = yield* Effect.flip(
-        JsonWebToken.sign({ sub: "u" }, { key: secret, protectedHeader: { alg: "HS256" } })
+        jwt.sign({ sub: "u" }, { key: secret, protectedHeader: { alg: "HS256" } })
       )
       assert(error._tag === "ClaimValidationError")
       assert.strictEqual(error.claim, "exp")
-      yield* JsonWebToken.sign({ sub: "u", exp: 2_000_000_000 }, { key: secret, protectedHeader: { alg: "HS256" } })
-    }).pipe(Effect.provide(CryptoLive)))
+      yield* jwt.sign({ sub: "u", exp: 2_000_000_000 }, { key: secret, protectedHeader: { alg: "HS256" } })
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("algorithms required for keys that do not pin one", () => {
   it.effect("is optional with a Crypto.Key and a defect when missing otherwise", () =>
     Effect.gen(function*() {
-      const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256")
-      const token = yield* JsonWebSignature.signCompact("x", { key: privateKey, protectedHeader: { alg: "ES256" } })
-      yield* JsonWebSignature.verifyCompact(token, publicKey)
-      const verifyUntyped = JsonWebSignature.verifyCompact as (
+      const keys = yield* JsonWebKey.JsonWebKey
+      const jws = yield* JsonWebSignature.JsonWebSignature
+      const { privateKey, publicKey } = yield* keys.generateKeyPair("ES256")
+      const token = yield* jws.signCompact("x", { key: privateKey, protectedHeader: { alg: "ES256" } })
+      yield* jws.verifyCompact(token, publicKey)
+      const verifyUntyped = jws.verifyCompact as (
         ...args: ReadonlyArray<unknown>
       ) => Effect.Effect<unknown>
       const exit = yield* Effect.exit(verifyUntyped(token, secret))
       assert.isTrue(exit._tag === "Failure" && String(exit.cause).includes("algorithms"))
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
 
 describe("remote key set freshness", () => {
   it.effect("honours Cache-Control max-age below cacheMaxAge, and refresh fetches on demand", () =>
     Effect.gen(function*() {
-      const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-      const jwk = { ...(yield* JsonWebKey.exportJwk(publicKey)), kid: "k" }
-      const token = yield* JsonWebSignature.signCompact("x", {
+      const keys = yield* JsonWebKey.JsonWebKey
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
+      const { privateKey, publicKey } = yield* keys.generateKeyPair("ES256", { extractable: true })
+      const jwk = { ...(yield* keys.exportJwk(publicKey)), kid: "k" }
+      const token = yield* jws.signCompact("x", {
         key: privateKey,
         protectedHeader: { alg: "ES256", kid: "k" }
       })
@@ -252,17 +275,17 @@ describe("remote key set freshness", () => {
         )
       )
       yield* Effect.gen(function*() {
-        const keys = yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks")
-        yield* keys.refresh
+        const resolver = yield* keySets.makeRemote("https://issuer.example/jwks")
+        yield* resolver.refresh
         assert.strictEqual(requests, 1)
-        yield* JsonWebSignature.verifyCompact(token, keys, { algorithms: ["ES256"] })
+        yield* jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
         assert.strictEqual(requests, 1)
         yield* TestClock.adjust("59 seconds")
-        yield* JsonWebSignature.verifyCompact(token, keys, { algorithms: ["ES256"] })
+        yield* jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
         assert.strictEqual(requests, 1)
         yield* TestClock.adjust("2 seconds")
-        yield* JsonWebSignature.verifyCompact(token, keys, { algorithms: ["ES256"] })
+        yield* jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
         assert.strictEqual(requests, 2)
       }).pipe(Effect.provide(http))
-    }).pipe(Effect.provide([CryptoLive, TestClock.layer()])))
+    }).pipe(Effect.provide([JoseLive, TestClock.layer()])))
 })

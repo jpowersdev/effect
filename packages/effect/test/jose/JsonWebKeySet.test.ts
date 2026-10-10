@@ -7,13 +7,15 @@ import * as Layer from "effect/Layer"
 import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as Redacted from "effect/Redacted"
 import * as TestClock from "effect/testing/TestClock"
-import { CryptoLive } from "./utils.ts"
+import { JoseLive } from "./utils.ts"
 
 const keySetWithoutKids = Effect.gen(function*() {
-  const a = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-  const b = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-  const jwks = { keys: [yield* JsonWebKey.exportJwk(a.publicKey), yield* JsonWebKey.exportJwk(b.publicKey)] }
-  const token = yield* JsonWebSignature.signCompact("x", { key: b.privateKey, protectedHeader: { alg: "ES256" } })
+  const keys = yield* JsonWebKey.JsonWebKey
+  const jws = yield* JsonWebSignature.JsonWebSignature
+  const a = yield* keys.generateKeyPair("ES256", { extractable: true })
+  const b = yield* keys.generateKeyPair("ES256", { extractable: true })
+  const jwks = { keys: [yield* keys.exportJwk(a.publicKey), yield* keys.exportJwk(b.publicKey)] }
+  const token = yield* jws.signCompact("x", { key: b.privateKey, protectedHeader: { alg: "ES256" } })
   return { jwks, token }
 })
 
@@ -31,36 +33,43 @@ const serving = (body: () => unknown, onRequest: () => void) =>
 describe("JsonWebKeySet", () => {
   it.effect("fails on several matching keys unless tryEach is chosen", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { jwks, token } = yield* keySetWithoutKids
-      const strict = yield* JsonWebKeySet.makeLocal(jwks)
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, strict, { algorithms: ["ES256"] }))
+      const strict = yield* keySets.makeLocal(jwks)
+      const error = yield* Effect.flip(jws.verifyCompact(token, strict, { algorithms: ["ES256"] }))
       assert.strictEqual(error._tag, "MultipleMatchingKeysError")
-      const tryEach = yield* JsonWebKeySet.makeLocal(jwks, { multipleMatches: "tryEach" })
-      yield* JsonWebSignature.verifyCompact(token, tryEach, { algorithms: ["ES256"] })
-    }).pipe(Effect.provide(CryptoLive)))
+      const tryEach = yield* keySets.makeLocal(jwks, { multipleMatches: "tryEach" })
+      yield* jws.verifyCompact(token, tryEach, { algorithms: ["ES256"] })
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("tryEach still rejects tokens no candidate signed", () =>
     Effect.gen(function*() {
+      const keys = yield* JsonWebKey.JsonWebKey
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { jwks } = yield* keySetWithoutKids
-      const other = yield* JsonWebKey.generateKeyPair("ES256")
-      const token = yield* JsonWebSignature.signCompact("x", {
+      const other = yield* keys.generateKeyPair("ES256")
+      const token = yield* jws.signCompact("x", {
         key: other.privateKey,
         protectedHeader: { alg: "ES256" }
       })
-      const resolver = yield* JsonWebKeySet.makeLocal(jwks, { multipleMatches: "tryEach" })
-      const error = yield* Effect.flip(JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] }))
+      const resolver = yield* keySets.makeLocal(jwks, { multipleMatches: "tryEach" })
+      const error = yield* Effect.flip(jws.verifyCompact(token, resolver, { algorithms: ["ES256"] }))
       assert.strictEqual(error._tag, "SignatureVerificationError")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("persists remote key sets in a KeyValueStore", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { jwks, token } = yield* keySetWithoutKids
       let requests = 0
       const http = serving(() => jwks, () => requests++)
       const options = { storage: "keyValueStore", multipleMatches: "tryEach" } as const
       const verifyWithFreshResolver = Effect.gen(function*() {
-        const resolver = yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks", options)
-        yield* JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
+        const resolver = yield* keySets.makeRemote("https://issuer.example/jwks", options)
+        yield* jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
       }).pipe(Effect.provide(http))
 
       yield* verifyWithFreshResolver
@@ -77,15 +86,17 @@ describe("JsonWebKeySet", () => {
       yield* kv.set("effect/jose/JsonWebKeySet/https://issuer.example/jwks", "not json")
       yield* verifyWithFreshResolver
       assert.strictEqual(requests, 3)
-    }).pipe(Effect.provide([CryptoLive, KeyValueStore.layerMemory, TestClock.layer()])))
+    }).pipe(Effect.provide([JoseLive, KeyValueStore.layerMemory, TestClock.layer()])))
 
   it.effect("memory storage does not require a KeyValueStore", () =>
     Effect.gen(function*() {
+      const keySets = yield* JsonWebKeySet.JsonWebKeySet
+      const jws = yield* JsonWebSignature.JsonWebSignature
       const { token } = yield* keySetWithoutKids
-      const resolver = yield* JsonWebKeySet.makeRemote("https://issuer.example/jwks", { multipleMatches: "tryEach" })
-      yield* JsonWebSignature.verifyCompact(token, resolver, { algorithms: ["ES256"] })
+      const resolver = yield* keySets.makeRemote("https://issuer.example/jwks", { multipleMatches: "tryEach" })
+      yield* jws.verifyCompact(token, resolver, { algorithms: ["ES256"] })
     }).pipe(
-      Effect.provide([CryptoLive, serving(() => ({ keys: [] }), () => {})]),
+      Effect.provide([JoseLive, serving(() => ({ keys: [] }), () => {})]),
       Effect.flip,
       Effect.map((e) =>
         // The served set is empty, so the point is only that this type-checks and runs without KeyValueStore.
@@ -97,43 +108,47 @@ describe("JsonWebKeySet", () => {
 describe("JsonWebSignature.embeddedKey", () => {
   it.effect("verifies with the public key in the protected header", () =>
     Effect.gen(function*() {
-      const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-      const jwk = yield* JsonWebKey.exportJwk(publicKey)
-      const token = yield* JsonWebSignature.signCompact("x", {
+      const keys = yield* JsonWebKey.JsonWebKey
+      const jws = yield* JsonWebSignature.JsonWebSignature
+      const { privateKey, publicKey } = yield* keys.generateKeyPair("ES256", { extractable: true })
+      const jwk = yield* keys.exportJwk(publicKey)
+      const token = yield* jws.signCompact("x", {
         key: privateKey,
         protectedHeader: { alg: "ES256", jwk }
       })
-      const { protectedHeader } = yield* JsonWebSignature.verifyCompact(token, JsonWebSignature.embeddedKey, {
+      const { protectedHeader } = yield* jws.verifyCompact(token, JsonWebSignature.embeddedKey, {
         algorithms: ["ES256"]
       })
       assert.deepStrictEqual(protectedHeader?.jwk, jwk)
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 
   it.effect("rejects missing, unprotected, private, and symmetric embedded keys", () =>
     Effect.gen(function*() {
-      const { privateKey, publicKey } = yield* JsonWebKey.generateKeyPair("ES256", { extractable: true })
-      const jwk = yield* JsonWebKey.exportJwk(publicKey)
-      const privateJwk = Redacted.value(yield* JsonWebKey.exportPrivateJwk(privateKey))
+      const keys = yield* JsonWebKey.JsonWebKey
+      const jws = yield* JsonWebSignature.JsonWebSignature
+      const { privateKey, publicKey } = yield* keys.generateKeyPair("ES256", { extractable: true })
+      const jwk = yield* keys.exportJwk(publicKey)
+      const privateJwk = Redacted.value(yield* keys.exportPrivateJwk(privateKey))
       const cases: ReadonlyArray<Omit<JsonWebSignature.SignOptions, "key">> = [
         { protectedHeader: { alg: "ES256" } },
         { protectedHeader: { alg: "ES256" }, unprotectedHeader: { jwk } },
         { protectedHeader: { alg: "ES256", jwk: privateJwk } }
       ]
       for (const header of cases) {
-        const jws = yield* JsonWebSignature.signFlattened("x", { key: privateKey, ...header })
+        const signed = yield* jws.signFlattened("x", { key: privateKey, ...header })
         const error = yield* Effect.flip(
-          JsonWebSignature.verifyFlattened(jws, JsonWebSignature.embeddedKey, { algorithms: ["ES256"] })
+          jws.verifyFlattened(signed, JsonWebSignature.embeddedKey, { algorithms: ["ES256"] })
         )
         assert.strictEqual(error._tag, "MalformedJwsError")
       }
       const secret = new Uint8Array(32)
-      const hmac = yield* JsonWebSignature.signCompact("x", {
+      const hmac = yield* jws.signCompact("x", {
         key: secret,
         protectedHeader: { alg: "HS256", jwk: { kty: "oct", k: "AAAA" } }
       })
       const error = yield* Effect.flip(
-        JsonWebSignature.verifyCompact(hmac, JsonWebSignature.embeddedKey, { algorithms: ["HS256"] })
+        jws.verifyCompact(hmac, JsonWebSignature.embeddedKey, { algorithms: ["HS256"] })
       )
       assert.strictEqual(error._tag, "MalformedJwsError")
-    }).pipe(Effect.provide(CryptoLive)))
+    }).pipe(Effect.provide(JoseLive)))
 })
