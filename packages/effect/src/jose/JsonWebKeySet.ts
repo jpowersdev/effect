@@ -1,8 +1,9 @@
 /**
  * Selects verification keys from JSON Web Key Sets (RFC 7517 section 5).
  *
- * A key set is turned into a {@link JsonWebSignature.KeyResolver} that picks
- * the key matching a token's `alg` and `kid` headers. Remote key sets are
+ * The {@link JsonWebKeySet} service turns a key set into a
+ * {@link JsonWebSignature.KeyResolver} that picks the key matching a token's
+ * `alg` and `kid` headers. Remote key sets are
  * fetched with `HttpClient`, cached, and refreshed when an unknown `kid` is
  * seen, subject to a cooldown.
  *
@@ -10,18 +11,20 @@
  * @since 4.0.0
  */
 import * as Clock from "../Clock.ts"
-import type * as Crypto from "../Crypto.ts"
+import * as Context from "../Context.ts"
+import * as Crypto from "../Crypto.ts"
 import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
 import * as FetchHttpClient from "../http/FetchHttpClient.ts"
 import * as HttpClient from "../http/HttpClient.ts"
 import type * as HttpClientError from "../http/HttpClientError.ts"
+import * as Layer from "../Layer.ts"
 import * as KeyValueStore from "../persistence/KeyValueStore.ts"
 import * as Schema from "../Schema.ts"
 import * as Semaphore from "../Semaphore.ts"
 import * as Stream from "../Stream.ts"
 import { JWS } from "./internal/algorithms.ts"
-import { isObject } from "./internal/shared.ts"
+import { isObject, provideCrypto } from "./internal/shared.ts"
 import { UnsupportedAlgorithmError } from "./JsonWebAlgorithm.ts"
 import * as JsonWebKey from "./JsonWebKey.ts"
 import type * as JsonWebSignature from "./JsonWebSignature.ts"
@@ -180,7 +183,10 @@ export const JwkSet = Schema.Struct({ keys: Schema.Array(JsonWebKey.Jwk) })
  * @category models
  * @since 4.0.0
  */
-export type Resolver<E = SelectError> = JsonWebSignature.KeyResolver<E, Crypto.Crypto>
+export type Resolver<E = SelectError> = JsonWebSignature.KeyResolver<E>
+
+/** A resolver before the service binds it to its `Crypto` service. */
+type CryptoResolver<E = SelectError> = JsonWebSignature.KeyResolver<E, Crypto.Crypto>
 
 const isJwkSet = (input: unknown): input is JwkSet =>
   isObject(input) && Array.isArray(input.keys) && input.keys.every(isObject)
@@ -217,26 +223,7 @@ export interface LocalOptions {
   readonly multipleMatches?: "fail" | "tryEach" | undefined
 }
 
-/**
- * Creates a resolver that selects keys from an in-memory key set.
- *
- * **Details**
- *
- * A key is a candidate when its `kty` and `crv` suit the token's `alg`, its
- * `kid` matches when the token has one, and its `alg`, `use`, and `key_ops`
- * permit verification. Exactly one candidate must match unless
- * `multipleMatches` is `"tryEach"`. Imported keys are cached per algorithm.
- *
- * **Gotchas**
- *
- * Key set members must be public keys, and symmetric `alg` values are
- * rejected.
- *
- * @stability unstable
- * @category constructors
- * @since 4.0.0
- */
-export const makeLocal = (jwks: JwkSet, options?: LocalOptions): Effect.Effect<Resolver, MalformedKeySetError> =>
+const makeLocal = (jwks: JwkSet, options?: LocalOptions): Effect.Effect<CryptoResolver, MalformedKeySetError> =>
   Effect.suspend(() => {
     let snapshot: unknown
     try {
@@ -262,7 +249,7 @@ export const makeLocal = (jwks: JwkSet, options?: LocalOptions): Effect.Effect<R
         cache.set(cacheKey, key)
         return key
       })
-    const resolver: Resolver = (protectedHeader, token) =>
+    const resolver: CryptoResolver = (protectedHeader, token) =>
       Effect.gen(function*() {
         const { alg, kid } = { ...protectedHeader, ...token?.header }
         const entry = typeof alg === "string" ? JWS[alg] : undefined
@@ -397,6 +384,10 @@ export interface RemoteResolver<E> extends Resolver<E> {
   readonly refresh: Effect.Effect<void, Exclude<E, SelectError> | MalformedKeySetError>
 }
 
+interface CryptoRemoteResolver<E> extends CryptoResolver<E> {
+  readonly refresh: Effect.Effect<void, Exclude<E, SelectError> | MalformedKeySetError>
+}
+
 const cacheControlMaxAge = (header: string | undefined): number | undefined => {
   if (header === undefined) return undefined
   const match = /(?:^|,)\s*max-age\s*=\s*"?(\d+)"?\s*(?:,|$)/i.exec(header)
@@ -434,27 +425,11 @@ const concatChunks = (chunks: ReadonlyArray<Uint8Array>): Uint8Array => {
   return out
 }
 
-/**
- * Creates a resolver backed by a key set fetched over HTTP.
- *
- * **Details**
- *
- * The set is fetched lazily on first use and refetched once it is older than
- * `cacheMaxAge`. When no key matches and the cooldown has elapsed, the set is
- * refetched and selection is retried once. Concurrent refetches are
- * coalesced. With `"keyValueStore"` storage, a stored set is used on first use
- * when it is still fresh, and every fetch is written back; a stored value
- * that cannot be decoded is treated as missing.
- *
- * @stability unstable
- * @category constructors
- * @since 4.0.0
- */
-export const makeRemote = <const O extends RemoteOptions = {}>(
+const makeRemote = <const O extends RemoteOptions = {}>(
   url: string | URL,
   options?: O
 ): Effect.Effect<
-  RemoteResolver<RemoteSelectError | StorageError<O>>,
+  CryptoRemoteResolver<RemoteSelectError | StorageError<O>>,
   InvalidKeySetUrlError,
   HttpClient.HttpClient | StorageServices<O>
 > =>
@@ -473,7 +448,7 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
     const timeout = options?.timeoutDuration ?? Duration.seconds(5)
     const localOptions: LocalOptions = { multipleMatches: options?.multipleMatches }
     const lock = yield* Semaphore.make(1)
-    let local: Resolver | undefined
+    let local: CryptoResolver | undefined
     let fetchedAt = -Infinity
     let expiresAt = -Infinity
 
@@ -568,7 +543,7 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
         return local
       }))
 
-    const resolver: Resolver<RemoteSelectError | KeyValueStore.KeyValueStoreError> = (protectedHeader, token) =>
+    const resolver: CryptoResolver<RemoteSelectError | KeyValueStore.KeyValueStoreError> = (protectedHeader, token) =>
       Effect.gen(function*() {
         const resolve = yield* reload(false)
         const result = yield* Effect.result(resolve(protectedHeader, token))
@@ -579,11 +554,119 @@ export const makeRemote = <const O extends RemoteOptions = {}>(
         const fresh = yield* reload(true)
         return yield* fresh(protectedHeader, token)
       })
-    return Object.assign(resolver, { refresh: Effect.asVoid(reload(true)) }) as RemoteResolver<
+    return Object.assign(resolver, { refresh: Effect.asVoid(reload(true)) }) as CryptoRemoteResolver<
       RemoteSelectError | StorageError<O>
     >
   }) as unknown as Effect.Effect<
+    CryptoRemoteResolver<RemoteSelectError | StorageError<O>>,
+    InvalidKeySetUrlError,
+    HttpClient.HttpClient | StorageServices<O>
+  >
+
+/**
+ * Creates key resolvers from JSON Web Key Sets, importing their keys with the
+ * `Crypto` service provided to {@link layer}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JsonWebKeySet {
+  /**
+   * Creates a resolver that selects keys from an in-memory key set.
+   *
+   * **Details**
+   *
+   * A key is a candidate when its `kty` and `crv` suit the token's `alg`, its
+   * `kid` matches when the token has one, and its `alg`, `use`, and `key_ops`
+   * permit verification. Exactly one candidate must match unless
+   * `multipleMatches` is `"tryEach"`. Imported keys are cached per algorithm.
+   *
+   * **Gotchas**
+   *
+   * Key set members must be public keys, and symmetric `alg` values are
+   * rejected.
+   */
+  readonly makeLocal: (jwks: JwkSet, options?: LocalOptions) => Effect.Effect<Resolver, MalformedKeySetError>
+
+  /**
+   * Creates a resolver backed by a key set fetched over HTTP.
+   *
+   * **Details**
+   *
+   * The set is fetched lazily on first use and refetched once it is older than
+   * `cacheMaxAge`. When no key matches and the cooldown has elapsed, the set is
+   * refetched and selection is retried once. Concurrent refetches are
+   * coalesced. With `"keyValueStore"` storage, a stored set is used on first use
+   * when it is still fresh, and every fetch is written back; a stored value
+   * that cannot be decoded is treated as missing.
+   */
+  readonly makeRemote: <const O extends RemoteOptions = {}>(
+    url: string | URL,
+    options?: O
+  ) => Effect.Effect<
     RemoteResolver<RemoteSelectError | StorageError<O>>,
     InvalidKeySetUrlError,
     HttpClient.HttpClient | StorageServices<O>
   >
+}
+
+/**
+ * The {@link JsonWebKeySet} service.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const JsonWebKeySet: Context.Service<
+  JsonWebKeySet,
+  JsonWebKeySet
+> = Context.Service("effect/jose/JsonWebKeySet")
+
+/**
+ * Creates the {@link JsonWebKeySet} service with the current `Crypto` service.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const make: Effect.Effect<JsonWebKeySet, never, Crypto.Crypto> = Effect.map(
+  Effect.service(Crypto.Crypto),
+  (crypto) => {
+    const provide = provideCrypto(crypto)
+    return JsonWebKeySet.of({
+      makeLocal: (jwks, options) => Effect.map(makeLocal(jwks, options), provide),
+      makeRemote: (url, options) =>
+        Effect.map(makeRemote(url, options), (remote) => Object.assign(provide(remote), { refresh: remote.refresh }))
+    })
+  }
+)
+
+/**
+ * Provides the {@link JsonWebKeySet} service, requiring `Crypto`.
+ *
+ * **Example** (Verifying tokens against an identity provider's key set)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebKeySet, JsonWebToken } from "effect/jose"
+ *
+ * declare const token: string
+ *
+ * const program = Effect.gen(function*() {
+ *   const keySets = yield* JsonWebKeySet.JsonWebKeySet
+ *   const jwt = yield* JsonWebToken.JsonWebToken
+ *   const keys = yield* keySets.makeRemote("https://auth.example.com/.well-known/jwks.json")
+ *   const { payload } = yield* jwt.verify(token, keys, {
+ *     algorithms: ["ES256"],
+ *     issuer: "https://auth.example.com"
+ *   })
+ *   return payload.sub
+ * })
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layer: Layer.Layer<JsonWebKeySet, never, Crypto.Crypto> = Layer.effect(JsonWebKeySet, make)

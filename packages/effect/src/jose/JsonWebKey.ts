@@ -30,6 +30,7 @@ import {
   isCryptoKey,
   isObject,
   mapPlatformError,
+  provideCrypto,
   raise
 } from "./internal/shared.ts"
 import type * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
@@ -338,26 +339,29 @@ export const makeKeyCache = (options: KeyCacheOptions): Effect.Effect<KeyCache> 
  *
  * **When to use**
  *
- * Use as part of the application's root layer, next to the `Crypto` layer,
- * so every operation in the program shares one cache.
+ * Use as part of the application's root layer, next to the JOSE service
+ * layers, so every operation in the program shares one cache.
  *
  * **Example** (Providing the key cache at the root of a program)
  *
  * ```ts
- * import { Effect, Layer } from "effect"
+ * import { type Crypto, Effect, Layer } from "effect"
  * import { JsonWebKey, JsonWebSignature } from "effect/jose"
  *
- * declare const CryptoLive: Layer.Layer<never>
+ * declare const CryptoLive: Layer.Layer<Crypto.Crypto>
  * declare const loadKeyFor: (token: string) => Effect.Effect<JsonWebKey.Jwk>
  *
  * // Request handling passes JWKs loaded per request; the cache avoids
  * // re-importing the same key on every request.
- * const authenticate = (token: string) =>
- *   Effect.flatMap(loadKeyFor(token), (jwk) => JsonWebSignature.verifyCompact(token, jwk, { algorithms: ["ES256"] }))
+ * const authenticate = Effect.fn("authenticate")(function*(token: string) {
+ *   const jws = yield* JsonWebSignature.JsonWebSignature
+ *   const jwk = yield* loadKeyFor(token)
+ *   return yield* jws.verifyCompact(token, jwk, { algorithms: ["ES256"] })
+ * })
  *
  * // Provide the cache once, where the program is assembled.
  * const AppLive = Layer.mergeAll(
- *   CryptoLive,
+ *   JsonWebSignature.layer.pipe(Layer.provide(CryptoLive)),
  *   JsonWebKey.layerKeyCache({ capacity: 1000, timeToLive: "1 hour" })
  * )
  * ```
@@ -580,21 +584,7 @@ const entryFor = (alg: unknown): KeyEntry => {
   return entry
 }
 
-/**
- * Imports a JSON Web Key for use with `alg`.
- *
- * **Details**
- *
- * `alg` defaults to the JWK's `alg` parameter. Symmetric `oct` keys are
- * returned as raw secret bytes; other keys are imported as `Crypto.Key`
- * handles. Private keys are not extractable unless `extractable` is set or
- * the JWK sets `ext: true`.
- *
- * @stability unstable
- * @category importing
- * @since 4.0.0
- */
-export const importJwk = (
+const importJwk = (
   input: Jwk | Redacted.Redacted<Jwk>,
   alg?: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
@@ -698,27 +688,13 @@ const importDer = (format: "spki" | "pkcs8", label: string) =>
     )
   })
 
-/**
- * Imports a PEM-encoded SPKI public key for use with `alg`.
- *
- * @stability unstable
- * @category importing
- * @since 4.0.0
- */
-export const importSpki: (
+const importSpki: (
   pem: string,
   alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ) => Effect.Effect<Crypto.Key, KeyError, Crypto.Crypto> = importDer("spki", "PUBLIC KEY")
 
-/**
- * Imports a PEM-encoded PKCS #8 private key for use with `alg`.
- *
- * @stability unstable
- * @category importing
- * @since 4.0.0
- */
-export const importPkcs8: (
+const importPkcs8: (
   pem: string | Redacted.Redacted<string>,
   alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
@@ -734,42 +710,14 @@ const exportAnyJwk = (key: Key): Effect.Effect<Jwk, InvalidKeyError | PlatformEr
     return jwk as Jwk
   })
 
-/**
- * Exports a public key as a JSON Web Key.
- *
- * **When to use**
- *
- * Use to publish a public key, for example in a key set.
- *
- * **Gotchas**
- *
- * Private keys and secrets fail with {@link InvalidKeyError}; export them with
- * {@link exportPrivateJwk}, which keeps the result `Redacted`.
- *
- * @see {@link exportPrivateJwk} for private keys and secrets
- *
- * @stability unstable
- * @category exporting
- * @since 4.0.0
- */
-export const exportJwk = (
+const exportJwk = (
   key: Crypto.Key
 ): Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   isCryptoKey(key) && key.type !== "public"
     ? Effect.fail(invalidKey("exportJwk only exports public keys; use exportPrivateJwk"))
     : exportAnyJwk(key)
 
-/**
- * Exports an extractable private key, or a secret, as a `Redacted` JSON Web
- * Key so the key material does not leak into logs.
- *
- * @see {@link exportJwk} for public keys
- *
- * @stability unstable
- * @category exporting
- * @since 4.0.0
- */
-export const exportPrivateJwk = (
+const exportPrivateJwk = (
   key: Key
 ): Effect.Effect<Redacted.Redacted<Jwk>, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   isCryptoKey(key) && key.type === "public"
@@ -831,14 +779,7 @@ const exportDer =
       return derToPem(yield* crypto.exportKey(format, key), label)
     })
 
-/**
- * Exports an extractable public key as a PEM-encoded SPKI string.
- *
- * @stability unstable
- * @category exporting
- * @since 4.0.0
- */
-export const exportSpki = (
+const exportSpki = (
   key: Crypto.Key
 ): Effect.Effect<SpkiPem, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   exportDer("spki", "PUBLIC KEY", "public")(key) as Effect.Effect<
@@ -847,15 +788,7 @@ export const exportSpki = (
     Crypto.Crypto
   >
 
-/**
- * Exports an extractable private key as a `Redacted` PEM-encoded PKCS #8
- * string.
- *
- * @stability unstable
- * @category exporting
- * @since 4.0.0
- */
-export const exportPkcs8 = (
+const exportPkcs8 = (
   key: Crypto.Key
 ): Effect.Effect<Redacted.Redacted<Pkcs8Pem>, InvalidKeyError | PlatformError.PlatformError, Crypto.Crypto> =>
   Effect.map(exportDer("pkcs8", "PRIVATE KEY", "private")(key), (pem) => Redacted.make(pem as Pkcs8Pem))
@@ -878,18 +811,7 @@ export interface GenerateKeyPairOptions {
   readonly modulusLength?: number | undefined
 }
 
-/**
- * Generates a key pair for an asymmetric JWS or JWE algorithm.
- *
- * **Gotchas**
- *
- * Private keys are not extractable unless `extractable` is set.
- *
- * @stability unstable
- * @category generating
- * @since 4.0.0
- */
-export const generateKeyPair = (
+const generateKeyPair = (
   alg: JsonWebAlgorithm.Algorithm,
   options?: GenerateKeyPairOptions
 ): Effect.Effect<Crypto.KeyPair, KeyError, Crypto.Crypto> =>
@@ -917,19 +839,7 @@ export const generateKeyPair = (
     return generated as Crypto.KeyPair
   })
 
-/**
- * Generates a secret key for a symmetric JWS or JWE algorithm.
- *
- * **Details**
- *
- * AES-CBC-HMAC content encryption secrets are returned as raw bytes; other
- * secrets are `Crypto.Key` handles.
- *
- * @stability unstable
- * @category generating
- * @since 4.0.0
- */
-export const generateSecret = (
+const generateSecret = (
   alg: JsonWebAlgorithm.Algorithm,
   options?: { readonly extractable?: boolean | undefined }
 ): Effect.Effect<Key, KeyError, Crypto.Crypto> =>
@@ -1014,19 +924,7 @@ export type ThumbprintUri = typeof ThumbprintUri.Type
  */
 export type ThumbprintDigest = "sha256" | "sha384" | "sha512"
 
-/**
- * Computes the RFC 7638 thumbprint of a key as a base64url string.
- *
- * **Details**
- *
- * Only the required members for the key type are hashed, so public and
- * private keys of the same pair have the same thumbprint.
- *
- * @stability unstable
- * @category thumbprints
- * @since 4.0.0
- */
-export const thumbprint = (
+const thumbprint = (
   key: Jwk | Key | Redacted.Redacted<Jwk>,
   digest: ThumbprintDigest = "sha256"
 ): Effect.Effect<Thumbprint, KeyError, Crypto.Crypto> =>
@@ -1073,14 +971,7 @@ export const thumbprint = (
     return b64u(hash) as Thumbprint
   })
 
-/**
- * Computes the RFC 9278 JWK thumbprint URI of a key.
- *
- * @stability unstable
- * @category thumbprints
- * @since 4.0.0
- */
-export const thumbprintUri = (
+const thumbprintUri = (
   key: Jwk | Key | Redacted.Redacted<Jwk>,
   digest: ThumbprintDigest = "sha256"
 ): Effect.Effect<ThumbprintUri, KeyError, Crypto.Crypto> =>
@@ -1088,3 +979,193 @@ export const thumbprintUri = (
     thumbprint(key, digest),
     (value) => `urn:ietf:params:oauth:jwk-thumbprint:sha-${digest.slice(-3)}:${value}` as ThumbprintUri
   )
+
+/**
+ * Imports, exports, generates, and fingerprints keys with the `Crypto`
+ * service provided to {@link layer}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JsonWebKey {
+  /**
+   * Imports a JSON Web Key for use with `alg`.
+   *
+   * **Details**
+   *
+   * `alg` defaults to the JWK's `alg` parameter. Symmetric `oct` keys are
+   * returned as raw secret bytes; other keys are imported as `Crypto.Key`
+   * handles. Private keys are not extractable unless `extractable` is set or
+   * the JWK sets `ext: true`.
+   */
+  readonly importJwk: (
+    jwk: Jwk | Redacted.Redacted<Jwk>,
+    alg?: JsonWebAlgorithm.Algorithm,
+    options?: { readonly extractable?: boolean | undefined }
+  ) => Effect.Effect<Key, KeyError>
+
+  /**
+   * Imports a PEM-encoded SPKI public key for use with `alg`.
+   */
+  readonly importSpki: (
+    pem: string,
+    alg: JsonWebAlgorithm.Algorithm,
+    options?: { readonly extractable?: boolean | undefined }
+  ) => Effect.Effect<Crypto.Key, KeyError>
+
+  /**
+   * Imports a PEM-encoded PKCS #8 private key for use with `alg`.
+   */
+  readonly importPkcs8: (
+    pem: string | Redacted.Redacted<string>,
+    alg: JsonWebAlgorithm.Algorithm,
+    options?: { readonly extractable?: boolean | undefined }
+  ) => Effect.Effect<Crypto.Key, KeyError>
+
+  /**
+   * Exports a public key as a JSON Web Key.
+   *
+   * **When to use**
+   *
+   * Use to publish a public key, for example in a key set.
+   *
+   * **Gotchas**
+   *
+   * Private keys and secrets fail with {@link InvalidKeyError}; export them with
+   * `exportPrivateJwk`, which keeps the result `Redacted`.
+   *
+   * @see `exportPrivateJwk` for private keys and secrets
+   */
+  readonly exportJwk: (key: Crypto.Key) => Effect.Effect<Jwk, InvalidKeyError | PlatformError.PlatformError>
+
+  /**
+   * Exports an extractable private key, or a secret, as a `Redacted` JSON Web
+   * Key so the key material does not leak into logs.
+   *
+   * @see `exportJwk` for public keys
+   */
+  readonly exportPrivateJwk: (
+    key: Key
+  ) => Effect.Effect<Redacted.Redacted<Jwk>, InvalidKeyError | PlatformError.PlatformError>
+
+  /**
+   * Exports an extractable public key as a PEM-encoded SPKI string.
+   */
+  readonly exportSpki: (key: Crypto.Key) => Effect.Effect<SpkiPem, InvalidKeyError | PlatformError.PlatformError>
+
+  /**
+   * Exports an extractable private key as a `Redacted` PEM-encoded PKCS #8
+   * string.
+   */
+  readonly exportPkcs8: (
+    key: Crypto.Key
+  ) => Effect.Effect<Redacted.Redacted<Pkcs8Pem>, InvalidKeyError | PlatformError.PlatformError>
+
+  /**
+   * Generates a key pair for an asymmetric JWS or JWE algorithm.
+   *
+   * **Gotchas**
+   *
+   * Private keys are not extractable unless `extractable` is set.
+   */
+  readonly generateKeyPair: (
+    alg: JsonWebAlgorithm.Algorithm,
+    options?: GenerateKeyPairOptions
+  ) => Effect.Effect<Crypto.KeyPair, KeyError>
+
+  /**
+   * Generates a secret key for a symmetric JWS or JWE algorithm.
+   *
+   * **Details**
+   *
+   * AES-CBC-HMAC content encryption secrets are returned as raw bytes; other
+   * secrets are `Crypto.Key` handles.
+   */
+  readonly generateSecret: (
+    alg: JsonWebAlgorithm.Algorithm,
+    options?: { readonly extractable?: boolean | undefined }
+  ) => Effect.Effect<Key, KeyError>
+
+  /**
+   * Computes the RFC 7638 thumbprint of a key as a base64url string.
+   *
+   * **Details**
+   *
+   * Only the required members for the key type are hashed, so public and
+   * private keys of the same pair have the same thumbprint.
+   */
+  readonly thumbprint: (
+    key: Jwk | Key | Redacted.Redacted<Jwk>,
+    digest?: ThumbprintDigest
+  ) => Effect.Effect<Thumbprint, KeyError>
+
+  /**
+   * Computes the RFC 9278 JWK thumbprint URI of a key.
+   */
+  readonly thumbprintUri: (
+    key: Jwk | Key | Redacted.Redacted<Jwk>,
+    digest?: ThumbprintDigest
+  ) => Effect.Effect<ThumbprintUri, KeyError>
+}
+
+/**
+ * The {@link JsonWebKey} service.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const JsonWebKey: Context.Service<
+  JsonWebKey,
+  JsonWebKey
+> = Context.Service("effect/jose/JsonWebKey")
+
+/**
+ * Creates the {@link JsonWebKey} service with the current `Crypto` service.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const make: Effect.Effect<JsonWebKey, never, Crypto.Crypto> = Effect.map(
+  Effect.service(Crypto.Crypto),
+  (crypto) => {
+    const provide = provideCrypto(crypto)
+    return JsonWebKey.of({
+      importJwk: provide(importJwk),
+      importSpki: provide(importSpki),
+      importPkcs8: provide(importPkcs8),
+      exportJwk: provide(exportJwk),
+      exportPrivateJwk: provide(exportPrivateJwk),
+      exportSpki: provide(exportSpki),
+      exportPkcs8: provide(exportPkcs8),
+      generateKeyPair: provide(generateKeyPair),
+      generateSecret: provide(generateSecret),
+      thumbprint: provide(thumbprint),
+      thumbprintUri: provide(thumbprintUri)
+    })
+  }
+)
+
+/**
+ * Provides the {@link JsonWebKey} service, requiring `Crypto`.
+ *
+ * **Example** (Generating a key pair and its thumbprint)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebKey } from "effect/jose"
+ *
+ * const program = Effect.gen(function*() {
+ *   const keys = yield* JsonWebKey.JsonWebKey
+ *   const { publicKey } = yield* keys.generateKeyPair("ES256")
+ *   return yield* keys.thumbprint(publicKey)
+ * })
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layer: Layer.Layer<JsonWebKey, never, Crypto.Crypto> = Layer.effect(JsonWebKey, make)

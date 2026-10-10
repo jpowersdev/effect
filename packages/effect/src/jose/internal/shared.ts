@@ -1,9 +1,22 @@
-import type * as Crypto from "../../Crypto.ts"
+import * as Crypto from "../../Crypto.ts"
 import * as Effect from "../../Effect.ts"
 import * as Base64Url from "../../encoding/Base64Url.ts"
 import type * as PlatformError from "../../PlatformError.ts"
 import * as Redacted from "../../Redacted.ts"
 import * as Result from "../../Result.ts"
+
+/**
+ * Binds operations to a `Crypto` service, so the services built from them do
+ * not require it.
+ *
+ * @internal
+ */
+export const provideCrypto = (crypto: Crypto.Crypto) =>
+<Args extends ReadonlyArray<any>, A, E, R>(
+  f: (...args: Args) => Effect.Effect<A, E, R>
+) =>
+(...args: Args): Effect.Effect<A, E, Exclude<R, Crypto.Crypto>> =>
+  Effect.provideService(f(...args), Crypto.Crypto, crypto)
 
 /** @internal */
 export const encoder = new TextEncoder()

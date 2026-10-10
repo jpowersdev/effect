@@ -11,12 +11,22 @@
  * @since 4.0.0
  */
 import * as Clock from "../Clock.ts"
-import type * as Crypto from "../Crypto.ts"
+import * as Context from "../Context.ts"
+import * as Crypto from "../Crypto.ts"
 import * as Duration from "../Duration.ts"
 import * as Effect from "../Effect.ts"
+import * as Layer from "../Layer.ts"
 import type * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
-import { attemptWith, isObject, parseHeader, raise, readToken, strictDecoder } from "./internal/shared.ts"
+import {
+  attemptWith,
+  isObject,
+  parseHeader,
+  provideCrypto,
+  raise,
+  readToken,
+  strictDecoder
+} from "./internal/shared.ts"
 import type * as JsonWebAlgorithm from "./JsonWebAlgorithm.ts"
 import * as JsonWebEncryption from "./JsonWebEncryption.ts"
 import * as JsonWebSignature from "./JsonWebSignature.ts"
@@ -401,44 +411,7 @@ export const buildClaims = (claims: Claims, options: IssueOptions, now: number):
 
 const rejectUnencoded = () => raise(malformed("JWTs MUST NOT use unencoded payload"))
 
-/**
- * Issues a JWT signed with JWS compact serialization.
- *
- * **Example** (Issuing and verifying a token)
- *
- * ```ts
- * import { Effect } from "effect"
- * import { JsonWebToken } from "effect/jose"
- *
- * const secret = new TextEncoder().encode("a-string-secret-at-least-256-bits-long")
- *
- * const program = Effect.gen(function*() {
- *   const token = yield* JsonWebToken.sign({ role: "admin" }, {
- *     key: secret,
- *     protectedHeader: { alg: "HS256" },
- *     issuer: "urn:example:issuer",
- *     expirationTime: "2 hours",
- *     issuedAt: true
- *   })
- *   const { payload } = yield* JsonWebToken.verify(token, secret, {
- *     algorithms: ["HS256"],
- *     issuer: "urn:example:issuer"
- *   })
- *   return payload.role
- * })
- * ```
- *
- * @stability unstable
- * @category signing
- * @since 4.0.0
- */
-export const sign: {
-  <S extends Schema.Constraint>(
-    claims: S["Type"],
-    options: SignOptions & { readonly schema: S }
-  ): Effect.Effect<Redacted.Redacted<Signed>, SignError | ClaimValidationError, Crypto.Crypto | S["EncodingServices"]>
-  (claims: Claims, options: SignOptions): Effect.Effect<Redacted.Redacted<Signed>, SignError, Crypto.Crypto>
-} = (
+const sign = (
   claims: unknown,
   options: SignOptions & { readonly schema?: Schema.Constraint }
 ): Effect.Effect<Redacted.Redacted<Signed>, any, any> =>
@@ -582,65 +555,7 @@ const decodeWith = <S extends Schema.Constraint>(schema: S) => (payload: Record<
       })
   )
 
-/**
- * Verifies a signed JWT and validates its claims.
- *
- * **Details**
- *
- * When `schema` is provided, the claims set is decoded with it after the
- * registered claims are validated and the result is typed accordingly.
- *
- * **Gotchas**
- *
- * `algorithms` is required unless the key is a `Crypto.Key`, which is bound to
- * one algorithm.
- *
- * **Example** (Rejecting revoked tokens)
- *
- * Revocation and replay checks compose after verification, for example
- * against a deny-list keyed by `jti`:
- *
- * ```ts
- * import { Effect } from "effect"
- * import { JsonWebToken } from "effect/jose"
- *
- * declare const token: string
- * declare const secret: Uint8Array
- * declare const isRevoked: (jti: string | undefined) => Effect.Effect<boolean>
- *
- * const verified = JsonWebToken.verify(token, secret, { algorithms: ["HS256"] }).pipe(
- *   Effect.tap(({ payload }) =>
- *     Effect.flatMap(isRevoked(payload.jti), (revoked) =>
- *       revoked ? Effect.fail(new Error("token revoked")) : Effect.void)
- *   )
- * )
- * ```
- *
- * @stability unstable
- * @category verification
- * @since 4.0.0
- */
-export const verify: {
-  <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>, S extends Schema.Constraint>(
-    token: JsonWebSignature.TokenInput,
-    key: K,
-    options: JsonWebSignature.OptionsFor<K, VerifyOptions> & { readonly schema: S }
-  ): Effect.Effect<
-    Result<S["Type"]>,
-    VerifyError | JsonWebSignature.ResolverError<K>,
-    Crypto.Crypto | JsonWebSignature.ResolverServices<K> | S["DecodingServices"]
-  >
-  <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>>(
-    token: JsonWebSignature.TokenInput,
-    key: K,
-    ...options: [K] extends [Crypto.Key] ? [options?: VerifyOptions]
-      : [options: JsonWebSignature.OptionsFor<K, VerifyOptions>]
-  ): Effect.Effect<
-    Result<Claims>,
-    VerifyError | JsonWebSignature.ResolverError<K>,
-    Crypto.Crypto | JsonWebSignature.ResolverServices<K>
-  >
-} = <E, R>(
+const verify = <E, R>(
   token: JsonWebSignature.TokenInput,
   key: JsonWebSignature.Key | JsonWebSignature.KeyResolver<E, R>,
   options?: VerifyOptions & { readonly schema?: Schema.Constraint }
@@ -678,27 +593,7 @@ export interface EncryptOptions extends IssueOptions, Omit<JsonWebEncryption.Enc
   readonly replicateAudienceAsHeader?: boolean | undefined
 }
 
-/**
- * Issues a JWT encrypted with JWE compact serialization.
- *
- * @stability unstable
- * @category encryption
- * @since 4.0.0
- */
-export const encrypt: {
-  <S extends Schema.Constraint>(
-    claims: S["Type"],
-    options: EncryptOptions & { readonly schema: S }
-  ): Effect.Effect<
-    Redacted.Redacted<Encrypted>,
-    EncryptError,
-    Crypto.Crypto | S["EncodingServices"]
-  >
-  (
-    claims: Claims,
-    options: EncryptOptions
-  ): Effect.Effect<Redacted.Redacted<Encrypted>, EncryptError, Crypto.Crypto>
-} = (
+const encrypt = (
   claims: unknown,
   options: EncryptOptions & { readonly schema?: Schema.Constraint }
 ): Effect.Effect<Redacted.Redacted<Encrypted>, any, any> =>
@@ -727,30 +622,7 @@ export const encrypt: {
  */
 export interface DecryptOptions extends ClaimsOptions, JsonWebEncryption.DecryptOptions {}
 
-/**
- * Decrypts an encrypted JWT and validates its claims.
- *
- * **Details**
- *
- * Claims replicated into the protected header (`iss`, `sub`, `aud`) must
- * match the claims set.
- *
- * @stability unstable
- * @category encryption
- * @since 4.0.0
- */
-export const decrypt: {
-  <S extends Schema.Constraint, E = never, R = never>(
-    token: JsonWebSignature.TokenInput,
-    key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
-    options: DecryptOptions & { readonly schema: S }
-  ): Effect.Effect<Result<S["Type"]>, DecryptError | E, Crypto.Crypto | R | S["DecodingServices"]>
-  <E = never, R = never>(
-    token: JsonWebSignature.TokenInput,
-    key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
-    options?: DecryptOptions
-  ): Effect.Effect<Result<Claims>, DecryptError | E, Crypto.Crypto | R>
-} = <E, R>(
+const decrypt = <E, R>(
   token: JsonWebSignature.TokenInput,
   key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
   options?: DecryptOptions & { readonly schema?: Schema.Constraint }
@@ -780,8 +652,8 @@ export const decrypt: {
  *
  * **Gotchas**
  *
- * The returned claims are untrusted. Use {@link verify} before relying on
- * them.
+ * The returned claims are untrusted. Verify the token with
+ * {@link JsonWebToken} before relying on them.
  *
  * @stability unstable
  * @category decoding
@@ -799,3 +671,188 @@ export const decodeUnverified = (token: JsonWebSignature.TokenInput): Effect.Eff
     if (!parts[1]) return raise(malformed("JWTs must contain a payload"))
     return parseHeader(parts[1], malformed, "Invalid JWT Claims Set") as Claims
   })
+
+/**
+ * Issues and validates JSON Web Tokens with the `Crypto` service provided to
+ * {@link layer}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JsonWebToken {
+  /**
+   * Issues a JWT signed with JWS compact serialization.
+   *
+   * **Details**
+   *
+   * When `schema` is provided, the claims are encoded with it first.
+   */
+  readonly sign: {
+    <S extends Schema.Constraint>(
+      claims: S["Type"],
+      options: SignOptions & { readonly schema: S }
+    ): Effect.Effect<Redacted.Redacted<Signed>, SignError | ClaimValidationError, S["EncodingServices"]>
+    (claims: Claims, options: SignOptions): Effect.Effect<Redacted.Redacted<Signed>, SignError>
+  }
+
+  /**
+   * Verifies a signed JWT and validates its claims.
+   *
+   * **Details**
+   *
+   * When `schema` is provided, the claims set is decoded with it after the
+   * registered claims are validated and the result is typed accordingly.
+   *
+   * **Gotchas**
+   *
+   * `algorithms` is required unless the key is a `Crypto.Key`, which is bound to
+   * one algorithm.
+   *
+   * **Example** (Rejecting revoked tokens)
+   *
+   * Revocation and replay checks compose after verification, for example
+   * against a deny-list keyed by `jti`:
+   *
+   * ```ts
+   * import { Effect } from "effect"
+   * import { JsonWebToken } from "effect/jose"
+   *
+   * declare const token: string
+   * declare const secret: Uint8Array
+   * declare const isRevoked: (jti: string | undefined) => Effect.Effect<boolean>
+   *
+   * const verified = Effect.gen(function*() {
+   *   const jwt = yield* JsonWebToken.JsonWebToken
+   *   const { payload } = yield* jwt.verify(token, secret, { algorithms: ["HS256"] })
+   *   if (yield* isRevoked(payload.jti)) return yield* Effect.fail(new Error("token revoked"))
+   *   return payload
+   * })
+   * ```
+   */
+  readonly verify: {
+    <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>, S extends Schema.Constraint>(
+      token: JsonWebSignature.TokenInput,
+      key: K,
+      options: JsonWebSignature.OptionsFor<K, VerifyOptions> & { readonly schema: S }
+    ): Effect.Effect<
+      Result<S["Type"]>,
+      VerifyError | JsonWebSignature.ResolverError<K>,
+      JsonWebSignature.ResolverServices<K> | S["DecodingServices"]
+    >
+    <K extends JsonWebSignature.Key | JsonWebSignature.KeyResolver<any, any>>(
+      token: JsonWebSignature.TokenInput,
+      key: K,
+      ...options: [K] extends [Crypto.Key] ? [options?: VerifyOptions]
+        : [options: JsonWebSignature.OptionsFor<K, VerifyOptions>]
+    ): Effect.Effect<
+      Result<Claims>,
+      VerifyError | JsonWebSignature.ResolverError<K>,
+      JsonWebSignature.ResolverServices<K>
+    >
+  }
+
+  /**
+   * Issues a JWT encrypted with JWE compact serialization.
+   *
+   * **Details**
+   *
+   * When `schema` is provided, the claims are encoded with it first.
+   */
+  readonly encrypt: {
+    <S extends Schema.Constraint>(
+      claims: S["Type"],
+      options: EncryptOptions & { readonly schema: S }
+    ): Effect.Effect<Redacted.Redacted<Encrypted>, EncryptError, S["EncodingServices"]>
+    (claims: Claims, options: EncryptOptions): Effect.Effect<Redacted.Redacted<Encrypted>, EncryptError>
+  }
+
+  /**
+   * Decrypts an encrypted JWT and validates its claims.
+   *
+   * **Details**
+   *
+   * Claims replicated into the protected header (`iss`, `sub`, `aud`) must
+   * match the claims set. When `schema` is provided, the claims set is decoded
+   * with it.
+   */
+  readonly decrypt: {
+    <S extends Schema.Constraint, E = never, R = never>(
+      token: JsonWebSignature.TokenInput,
+      key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
+      options: DecryptOptions & { readonly schema: S }
+    ): Effect.Effect<Result<S["Type"]>, DecryptError | E, R | S["DecodingServices"]>
+    <E = never, R = never>(
+      token: JsonWebSignature.TokenInput,
+      key: JsonWebEncryption.Key | JsonWebEncryption.KeyResolver<E, R>,
+      options?: DecryptOptions
+    ): Effect.Effect<Result<Claims>, DecryptError | E, R>
+  }
+}
+
+/**
+ * The {@link JsonWebToken} service.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const JsonWebToken: Context.Service<
+  JsonWebToken,
+  JsonWebToken
+> = Context.Service("effect/jose/JsonWebToken")
+
+/**
+ * Creates the {@link JsonWebToken} service with the current `Crypto` service.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const make: Effect.Effect<JsonWebToken, never, Crypto.Crypto> = Effect.map(
+  Effect.service(Crypto.Crypto),
+  (crypto) => {
+    const provide = provideCrypto(crypto)
+    return JsonWebToken.of({
+      // The overloads are restated by the service interface.
+      sign: provide(sign) as JsonWebToken["sign"],
+      verify: provide(verify) as JsonWebToken["verify"],
+      encrypt: provide(encrypt) as JsonWebToken["encrypt"],
+      decrypt: provide(decrypt)
+    })
+  }
+)
+
+/**
+ * Provides the {@link JsonWebToken} service, requiring `Crypto`.
+ *
+ * **Example** (Issuing and verifying a token)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebToken } from "effect/jose"
+ *
+ * const secret = new TextEncoder().encode("a-string-secret-at-least-256-bits-long")
+ *
+ * const program = Effect.gen(function*() {
+ *   const jwt = yield* JsonWebToken.JsonWebToken
+ *   const token = yield* jwt.sign({ role: "admin" }, {
+ *     key: secret,
+ *     protectedHeader: { alg: "HS256" },
+ *     issuer: "urn:example:issuer",
+ *     expirationTime: "2 hours",
+ *     issuedAt: true
+ *   })
+ *   const { payload } = yield* jwt.verify(token, secret, {
+ *     algorithms: ["HS256"],
+ *     issuer: "urn:example:issuer"
+ *   })
+ *   return payload.role
+ * })
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layer: Layer.Layer<JsonWebToken, never, Crypto.Crypto> = Layer.effect(JsonWebToken, make)

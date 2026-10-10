@@ -10,8 +10,10 @@
  * @stability unstable
  * @since 4.0.0
  */
+import * as Context from "../Context.ts"
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import * as Layer from "../Layer.ts"
 import * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
 import { jwsAlgorithm } from "./internal/algorithms.ts"
@@ -28,6 +30,7 @@ import {
   JWS_RECOGNIZED,
   maxTokenLength,
   parseHeader,
+  provideCrypto,
   raise,
   readToken,
   serializeHeader,
@@ -227,7 +230,7 @@ export interface General {
 }
 
 /**
- * A flattened JWS produced by {@link signFlattened}, with its base64url
+ * A flattened JWS produced by `signFlattened`, with its base64url
  * members branded.
  *
  * **Details**
@@ -246,7 +249,7 @@ export interface SignedFlattened extends Flattened {
 }
 
 /**
- * A general JWS produced by {@link signGeneral}, with its base64url members
+ * A general JWS produced by `signGeneral`, with its base64url members
  * branded.
  *
  * @stability unstable
@@ -264,8 +267,8 @@ export interface SignedGeneral extends General {
  * **Gotchas**
  *
  * A JSON Web Key is imported on every call. To avoid repeated imports,
- * import it once with `JsonWebKey.importJwk` and pass the resulting key, or
- * provide `JsonWebKey.layerKeyCache`.
+ * import it once with `importJwk` from the `JsonWebKey` service and pass the
+ * resulting key, or provide `JsonWebKey.layerKeyCache`.
  *
  * @stability unstable
  * @category models
@@ -392,7 +395,7 @@ export type ResolverError<K> = 0 extends 1 & K ? never : K extends KeyResolver<i
 export type ResolverServices<K> = 0 extends 1 & K ? never : K extends KeyResolver<infer _E, infer R> ? R : never
 
 /**
- * Signature of the verify functions.
+ * Signature of the {@link JsonWebSignature} verify methods.
  *
  * @see {@link OptionsFor} for when `algorithms` is required
  *
@@ -405,7 +408,7 @@ export interface Verify<Input> {
     jws: Input,
     key: K,
     ...options: [K] extends [Crypto.Key] ? [options?: VerifyOptions] : [options: OptionsFor<K>]
-  ): Effect.Effect<VerifyResult, VerifyError | ResolverError<K>, Crypto.Crypto | ResolverServices<K>>
+  ): Effect.Effect<VerifyResult, VerifyError | ResolverError<K>, ResolverServices<K>>
 }
 
 /**
@@ -488,36 +491,7 @@ const createSignature = Effect.fnUntraced(function*(
   return { jws, b64: prepared.b64, payloadBytes: payload } satisfies Signed
 })
 
-/**
- * Produces a JWS in compact serialization.
- *
- * **Details**
- *
- * Unencoded payloads (`b64: false`) must contain only ASCII characters other
- * than `.` to be representable in compact serialization.
- *
- * **Example** (Signing and verifying a compact JWS)
- *
- * ```ts
- * import { Effect } from "effect"
- * import { JsonWebSignature } from "effect/jose"
- *
- * const secret = new TextEncoder().encode("a-string-secret-at-least-256-bits-long")
- *
- * const program = Effect.gen(function*() {
- *   const jws = yield* JsonWebSignature.signCompact("hello", {
- *     key: secret,
- *     protectedHeader: { alg: "HS256" }
- *   })
- *   const { payload } = yield* JsonWebSignature.verifyCompact(jws, secret, { algorithms: ["HS256"] })
- *   return new TextDecoder().decode(payload)
- * })
- * ```
- *
- * @stability unstable
- * @category signing
- * @since 4.0.0
- */
+/** @internal */
 export const signCompact = (
   payload: Uint8Array | string,
   options: Omit<SignOptions, "unprotectedHeader"> & { readonly protectedHeader: Header },
@@ -536,14 +510,7 @@ export const signCompact = (
     return Effect.succeed(Redacted.make(`${jws.protected}.${jws.payload}.${jws.signature}` as Compact))
   })
 
-/**
- * Produces a JWS in flattened JSON serialization.
- *
- * @stability unstable
- * @category signing
- * @since 4.0.0
- */
-export const signFlattened = (
+const signFlattened = (
   payload: Uint8Array | string,
   options: SignOptions
 ): Effect.Effect<SignedFlattened, SignError, Crypto.Crypto> =>
@@ -552,18 +519,7 @@ export const signFlattened = (
     ({ b64, jws, payloadBytes }) => b64 ? jws : { ...jws, payload: new TextDecoder().decode(payloadBytes) }
   )
 
-/**
- * Produces a JWS in general JSON serialization with one signature per signer.
- *
- * **Gotchas**
- *
- * All signers must agree on whether the payload is base64url encoded.
- *
- * @stability unstable
- * @category signing
- * @since 4.0.0
- */
-export const signGeneral = Effect.fnUntraced(function*(
+const signGeneral = Effect.fnUntraced(function*(
   payload: Uint8Array | string,
   signers: ReadonlyArray<SignOptions>
 ): Effect.fn.Return<SignedGeneral, SignError, Crypto.Crypto> {
@@ -769,33 +725,14 @@ export const verifyCompactInternal = <E, R>(
     )
   })
 
-/**
- * Verifies a JWS in compact serialization.
- *
- * **Details**
- *
- * `key` may be a key or a {@link KeyResolver}. The result contains the
- * decoded payload bytes and the protected header.
- *
- * @stability unstable
- * @category verification
- * @since 4.0.0
- */
-export const verifyCompact: Verify<TokenInput> = <E, R>(
+const verifyCompact = <E, R>(
   jws: TokenInput,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
 ): Effect.Effect<VerifyResult, VerifyError | E, Crypto.Crypto | R> =>
   Effect.map(verifyCompactInternal(jws, key, options), ({ b64: _, ...result }) => result)
 
-/**
- * Verifies a JWS in flattened JSON serialization.
- *
- * @stability unstable
- * @category verification
- * @since 4.0.0
- */
-export const verifyFlattened: Verify<Flattened> = <E, R>(
+const verifyFlattened = <E, R>(
   jws: Flattened,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
@@ -812,15 +749,7 @@ export const verifyFlattened: Verify<Flattened> = <E, R>(
     )
   })
 
-/**
- * Verifies a JWS in general JSON serialization, succeeding with the first
- * signature that verifies.
- *
- * @stability unstable
- * @category verification
- * @since 4.0.0
- */
-export const verifyGeneral: Verify<General> = <E, R>(
+const verifyGeneral = <E, R>(
   jws: General,
   key: Key | KeyResolver<E, R>,
   options?: VerifyOptions
@@ -917,3 +846,127 @@ export const embeddedKey: KeyResolver<MalformedJwsError> = (protectedHeader) =>
     }
     return Effect.succeed(jwk as Crypto.JwkData)
   })
+
+/**
+ * Signs and verifies JSON Web Signatures with the `Crypto` service provided
+ * to {@link layer}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JsonWebSignature {
+  /**
+   * Produces a JWS in compact serialization.
+   *
+   * **Details**
+   *
+   * Unencoded payloads (`b64: false`) must contain only ASCII characters other
+   * than `.` to be representable in compact serialization.
+   */
+  readonly signCompact: (
+    payload: Uint8Array | string,
+    options: Omit<SignOptions, "unprotectedHeader"> & { readonly protectedHeader: Header }
+  ) => Effect.Effect<Redacted.Redacted<Compact>, SignError>
+
+  /**
+   * Produces a JWS in flattened JSON serialization.
+   */
+  readonly signFlattened: (
+    payload: Uint8Array | string,
+    options: SignOptions
+  ) => Effect.Effect<SignedFlattened, SignError>
+
+  /**
+   * Produces a JWS in general JSON serialization with one signature per signer.
+   *
+   * **Gotchas**
+   *
+   * All signers must agree on whether the payload is base64url encoded.
+   */
+  readonly signGeneral: (
+    payload: Uint8Array | string,
+    signers: ReadonlyArray<SignOptions>
+  ) => Effect.Effect<SignedGeneral, SignError>
+
+  /**
+   * Verifies a JWS in compact serialization.
+   *
+   * **Details**
+   *
+   * `key` may be a key or a {@link KeyResolver}. The result contains the
+   * decoded payload bytes and the protected header.
+   */
+  readonly verifyCompact: Verify<TokenInput>
+
+  /**
+   * Verifies a JWS in flattened JSON serialization.
+   */
+  readonly verifyFlattened: Verify<Flattened>
+
+  /**
+   * Verifies a JWS in general JSON serialization, succeeding with the first
+   * signature that verifies.
+   */
+  readonly verifyGeneral: Verify<General>
+}
+
+/**
+ * The {@link JsonWebSignature} service.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const JsonWebSignature: Context.Service<
+  JsonWebSignature,
+  JsonWebSignature
+> = Context.Service("effect/jose/JsonWebSignature")
+
+/**
+ * Creates the {@link JsonWebSignature} service with the current `Crypto`
+ * service.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const make: Effect.Effect<JsonWebSignature, never, Crypto.Crypto> = Effect.map(
+  Effect.service(Crypto.Crypto),
+  (crypto) => {
+    const provide = provideCrypto(crypto)
+    return JsonWebSignature.of({
+      signCompact: provide(signCompact),
+      signFlattened: provide(signFlattened),
+      signGeneral: provide(signGeneral),
+      verifyCompact: provide(verifyCompact),
+      verifyFlattened: provide(verifyFlattened),
+      verifyGeneral: provide(verifyGeneral)
+    })
+  }
+)
+
+/**
+ * Provides the {@link JsonWebSignature} service, requiring `Crypto`.
+ *
+ * **Example** (Signing and verifying a compact JWS)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebSignature } from "effect/jose"
+ *
+ * const secret = new TextEncoder().encode("a-string-secret-at-least-256-bits-long")
+ *
+ * const program = Effect.gen(function*() {
+ *   const jws = yield* JsonWebSignature.JsonWebSignature
+ *   const token = yield* jws.signCompact("hello", { key: secret, protectedHeader: { alg: "HS256" } })
+ *   const { payload } = yield* jws.verifyCompact(token, secret, { algorithms: ["HS256"] })
+ *   return new TextDecoder().decode(payload)
+ * })
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layer: Layer.Layer<JsonWebSignature, never, Crypto.Crypto> = Layer.effect(JsonWebSignature, make)

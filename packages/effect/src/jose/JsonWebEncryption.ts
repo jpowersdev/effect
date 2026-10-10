@@ -15,8 +15,10 @@
  * @stability unstable
  * @since 4.0.0
  */
+import * as Context from "../Context.ts"
 import * as Crypto from "../Crypto.ts"
 import * as Effect from "../Effect.ts"
+import * as Layer from "../Layer.ts"
 import * as Redacted from "../Redacted.ts"
 import * as Schema from "../Schema.ts"
 import {
@@ -41,6 +43,7 @@ import {
   mapPlatformError,
   maxTokenLength,
   parseHeader,
+  provideCrypto,
   raise,
   readToken,
   serializeHeader,
@@ -242,7 +245,7 @@ export interface General {
 }
 
 /**
- * A flattened JWE produced by {@link encryptFlattened}, with its base64url
+ * A flattened JWE produced by `encryptFlattened`, with its base64url
  * members branded.
  *
  * @stability unstable
@@ -259,7 +262,7 @@ export interface EncryptedFlattened extends Flattened {
 }
 
 /**
- * A general JWE produced by {@link encryptGeneral}, with its base64url
+ * A general JWE produced by `encryptGeneral`, with its base64url
  * members branded.
  *
  * @stability unstable
@@ -284,8 +287,8 @@ export interface EncryptedGeneral extends General {
  * **Gotchas**
  *
  * A JSON Web Key is imported on every call. To avoid repeated imports,
- * import it once with `JsonWebKey.importJwk` and pass the resulting key, or
- * provide `JsonWebKey.layerKeyCache`.
+ * import it once with `importJwk` from the `JsonWebKey` service and pass the
+ * resulting key, or provide `JsonWebKey.layerKeyCache`.
  *
  * @stability unstable
  * @category models
@@ -933,14 +936,7 @@ const encryptJwe = (
     return jwe as EncryptedFlattened
   })
 
-/**
- * Produces a JWE in flattened JSON serialization.
- *
- * @stability unstable
- * @category encryption
- * @since 4.0.0
- */
-export const encryptFlattened = (
+const encryptFlattened = (
   plaintext: Uint8Array | string,
   options: EncryptOptions
 ): Effect.Effect<EncryptedFlattened, EncryptError, Crypto.Crypto> =>
@@ -949,30 +945,7 @@ export const encryptFlattened = (
     (checked) => encryptJwe(toBytes(plaintext), checked, options)
   )
 
-/**
- * Produces a JWE in compact serialization.
- *
- * **Example** (Encrypting and decrypting with a shared key)
- *
- * ```ts
- * import { Effect } from "effect"
- * import { JsonWebEncryption, JsonWebKey } from "effect/jose"
- *
- * const program = Effect.gen(function*() {
- *   const key = yield* JsonWebKey.generateSecret("A256KW")
- *   const jwe = yield* JsonWebEncryption.encryptCompact("secret message", {
- *     key,
- *     protectedHeader: { alg: "A256KW", enc: "A256GCM" }
- *   })
- *   const { plaintext } = yield* JsonWebEncryption.decryptCompact(jwe, key)
- *   return new TextDecoder().decode(plaintext)
- * })
- * ```
- *
- * @stability unstable
- * @category encryption
- * @since 4.0.0
- */
+/** @internal */
 export const encryptCompact = (
   plaintext: Uint8Array | string,
   options: Omit<EncryptOptions, "unprotectedHeader" | "sharedUnprotectedHeader" | "additionalAuthenticatedData"> & {
@@ -1001,19 +974,7 @@ export interface Recipient {
   readonly crit?: Readonly<Record<string, boolean>> | undefined
 }
 
-/**
- * Produces a JWE in general JSON serialization for one or more recipients.
- *
- * **Gotchas**
- *
- * All recipients must use the same `enc`, and direct key agreement or direct
- * encryption algorithms allow only a single recipient.
- *
- * @stability unstable
- * @category encryption
- * @since 4.0.0
- */
-export const encryptGeneral = (
+const encryptGeneral = (
   plaintext: Uint8Array | string,
   options: {
     readonly recipients: ReadonlyArray<Recipient>
@@ -1237,31 +1198,7 @@ const decryptJwe = <E, R>(
     return result
   })
 
-/**
- * Decrypts a JWE in compact serialization.
- *
- * **Example** (Rotating secrets)
- *
- * To rotate a secret without invalidating existing tokens, fall back to the
- * previous secret:
- *
- * ```ts
- * import { Effect } from "effect"
- * import { JsonWebEncryption } from "effect/jose"
- *
- * declare const token: string
- * declare const current: Uint8Array
- * declare const previous: Uint8Array
- *
- * const decrypted = JsonWebEncryption.decryptCompact(token, current).pipe(
- *   Effect.catchTag("DecryptionError", () => JsonWebEncryption.decryptCompact(token, previous))
- * )
- * ```
- *
- * @stability unstable
- * @category decryption
- * @since 4.0.0
- */
+/** @internal */
 export const decryptCompact = <E = never, R = never>(
   jwe: TokenInput,
   key: Key | KeyResolver<E, R>,
@@ -1290,14 +1227,7 @@ export const decryptCompact = <E = never, R = never>(
     return decryptJwe(flattened, options, key)
   })
 
-/**
- * Decrypts a JWE in flattened JSON serialization.
- *
- * @stability unstable
- * @category decryption
- * @since 4.0.0
- */
-export const decryptFlattened = <E = never, R = never>(
+const decryptFlattened = <E = never, R = never>(
   jwe: Flattened,
   key: Key | KeyResolver<E, R>,
   options?: DecryptOptions
@@ -1313,15 +1243,7 @@ export const decryptFlattened = <E = never, R = never>(
     )
   })
 
-/**
- * Decrypts a JWE in general JSON serialization, succeeding with the first
- * recipient that decrypts.
- *
- * @stability unstable
- * @category decryption
- * @since 4.0.0
- */
-export const decryptGeneral = <E = never, R = never>(
+const decryptGeneral = <E = never, R = never>(
   jwe: General,
   key: Key | KeyResolver<E, R>,
   options?: DecryptOptions
@@ -1343,3 +1265,161 @@ export const decryptGeneral = <E = never, R = never>(
     }
     return yield* Effect.fail(decryptionFailed())
   })
+
+/**
+ * Encrypts and decrypts JSON Web Encryption objects with the `Crypto` service
+ * provided to {@link layer}.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface JsonWebEncryption {
+  /**
+   * Produces a JWE in compact serialization.
+   */
+  readonly encryptCompact: (
+    plaintext: Uint8Array | string,
+    options: Omit<EncryptOptions, "unprotectedHeader" | "sharedUnprotectedHeader" | "additionalAuthenticatedData"> & {
+      readonly protectedHeader: Header
+    }
+  ) => Effect.Effect<Redacted.Redacted<Compact>, EncryptError>
+
+  /**
+   * Produces a JWE in flattened JSON serialization.
+   */
+  readonly encryptFlattened: (
+    plaintext: Uint8Array | string,
+    options: EncryptOptions
+  ) => Effect.Effect<EncryptedFlattened, EncryptError>
+
+  /**
+   * Produces a JWE in general JSON serialization for one or more recipients.
+   *
+   * **Gotchas**
+   *
+   * All recipients must use the same `enc`, and direct key agreement or direct
+   * encryption algorithms allow only a single recipient.
+   */
+  readonly encryptGeneral: (
+    plaintext: Uint8Array | string,
+    options: {
+      readonly recipients: ReadonlyArray<Recipient>
+      readonly protectedHeader?: Header | undefined
+      readonly sharedUnprotectedHeader?: Header | undefined
+      readonly additionalAuthenticatedData?: Uint8Array | undefined
+    }
+  ) => Effect.Effect<EncryptedGeneral, EncryptError>
+
+  /**
+   * Decrypts a JWE in compact serialization.
+   *
+   * **Example** (Rotating secrets)
+   *
+   * To rotate a secret without invalidating existing tokens, fall back to the
+   * previous secret:
+   *
+   * ```ts
+   * import { Effect } from "effect"
+   * import { JsonWebEncryption } from "effect/jose"
+   *
+   * declare const token: string
+   * declare const current: Uint8Array
+   * declare const previous: Uint8Array
+   *
+   * const decrypted = Effect.gen(function*() {
+   *   const jwe = yield* JsonWebEncryption.JsonWebEncryption
+   *   return yield* jwe.decryptCompact(token, current).pipe(
+   *     Effect.catchTag("DecryptionError", () => jwe.decryptCompact(token, previous))
+   *   )
+   * })
+   * ```
+   */
+  readonly decryptCompact: <E = never, R = never>(
+    jwe: TokenInput,
+    key: Key | KeyResolver<E, R>,
+    options?: DecryptOptions
+  ) => Effect.Effect<DecryptResult, DecryptError | E, R>
+
+  /**
+   * Decrypts a JWE in flattened JSON serialization.
+   */
+  readonly decryptFlattened: <E = never, R = never>(
+    jwe: Flattened,
+    key: Key | KeyResolver<E, R>,
+    options?: DecryptOptions
+  ) => Effect.Effect<DecryptResult, DecryptError | E, R>
+
+  /**
+   * Decrypts a JWE in general JSON serialization, succeeding with the first
+   * recipient that decrypts.
+   */
+  readonly decryptGeneral: <E = never, R = never>(
+    jwe: General,
+    key: Key | KeyResolver<E, R>,
+    options?: DecryptOptions
+  ) => Effect.Effect<DecryptResult, DecryptError | E, R>
+}
+
+/**
+ * The {@link JsonWebEncryption} service.
+ *
+ * @stability unstable
+ * @category services
+ * @since 4.0.0
+ */
+export const JsonWebEncryption: Context.Service<
+  JsonWebEncryption,
+  JsonWebEncryption
+> = Context.Service("effect/jose/JsonWebEncryption")
+
+/**
+ * Creates the {@link JsonWebEncryption} service with the current `Crypto`
+ * service.
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.0
+ */
+export const make: Effect.Effect<JsonWebEncryption, never, Crypto.Crypto> = Effect.map(
+  Effect.service(Crypto.Crypto),
+  (crypto) => {
+    const provide = provideCrypto(crypto)
+    return JsonWebEncryption.of({
+      encryptCompact: provide(encryptCompact),
+      encryptFlattened: provide(encryptFlattened),
+      encryptGeneral: provide(encryptGeneral),
+      decryptCompact: provide(decryptCompact),
+      decryptFlattened: provide(decryptFlattened),
+      decryptGeneral: provide(decryptGeneral)
+    })
+  }
+)
+
+/**
+ * Provides the {@link JsonWebEncryption} service, requiring `Crypto`.
+ *
+ * **Example** (Encrypting and decrypting with a shared key)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { JsonWebEncryption, JsonWebKey } from "effect/jose"
+ *
+ * const program = Effect.gen(function*() {
+ *   const keys = yield* JsonWebKey.JsonWebKey
+ *   const jwe = yield* JsonWebEncryption.JsonWebEncryption
+ *   const key = yield* keys.generateSecret("A256KW")
+ *   const token = yield* jwe.encryptCompact("secret message", {
+ *     key,
+ *     protectedHeader: { alg: "A256KW", enc: "A256GCM" }
+ *   })
+ *   const { plaintext } = yield* jwe.decryptCompact(token, key)
+ *   return new TextDecoder().decode(plaintext)
+ * })
+ * ```
+ *
+ * @stability unstable
+ * @category layers
+ * @since 4.0.0
+ */
+export const layer: Layer.Layer<JsonWebEncryption, never, Crypto.Crypto> = Layer.effect(JsonWebEncryption, make)
