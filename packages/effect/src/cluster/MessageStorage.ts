@@ -30,6 +30,7 @@ import * as DeliverAt from "./DeliverAt.ts"
 import type { EntityAddress } from "./EntityAddress.ts"
 import * as Envelope from "./Envelope.ts"
 import * as ClusterAbandon from "./internal/clusterAbandon.ts"
+import * as Versions from "./internal/versions.ts"
 import * as Message from "./Message.ts"
 import * as Reply from "./Reply.ts"
 import * as ShardId from "./ShardId.ts"
@@ -717,9 +718,20 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
             return Effect.succeed(result as SaveResult<any>)
           }
           const duplicate = result
+          const encodedReply = result.lastReceivedReply.value
           const schema = Reply.Reply(message.rpc, codecForJson)
-          return Schema.decodeEffect(schema)(result.lastReceivedReply.value).pipe(
+          return Versions.decode(message.rpc, schema)(encodedReply).pipe(
             Effect.provideContext(message.context),
+            Effect.catch((error) => {
+              const typed = Versions.typedError(message.rpc, error)
+              return typed === undefined ? Effect.fail(error) : Effect.succeed(
+                new Reply.WithExit({
+                  id: snowflakeGen.nextUnsafe(),
+                  requestId: duplicate.originalId,
+                  exit: Exit.fail(typed) as any
+                })
+              )
+            }),
             MalformedMessage.refail,
             Effect.map((reply) =>
               SaveResult.Duplicate({
@@ -742,9 +754,11 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
         Effect.asVoid
       ),
     saveReply: (reply) =>
-      Reply.serialize(reply, codecForJson).pipe(
-        Effect.map((encodedReply) => ({ encodedReply, persisted: reply })),
+      Reply.serializeWithContext(reply, codecForJson).pipe(
         Effect.catchTag("MalformedMessage", (error) => {
+          // The entity manager must end a failed chunk, including fencing its
+          // terminal reply and stopping the producer instead of waiting for ACK.
+          if (reply.reply._tag === "Chunk") return Effect.fail(error)
           const persisted = Reply.ReplyWithContext.fromDefect({
             id: reply.reply.id,
             requestId: reply.reply.requestId,
@@ -880,18 +894,20 @@ export const makeEncoded: (encoded: Encoded) => Effect.Effect<
         const message = messages.get(reply.requestId)
         if (!message) return Effect.void
         const schema = Reply.Reply(message.rpc, codecForJson)
-        return Schema.decodeEffect(schema)(reply).pipe(
+        return Versions.decode(message.rpc, schema)(reply).pipe(
           Effect.provideContext(message.context)
         ) as Effect.Effect<Reply.Reply<any>, Schema.SchemaError>
       }),
       (error) => {
         const reply = encodedReplies[index]
         ignoredRequests.add(reply.requestId)
+        // a reply written at a version this build doesn't know
+        const typed = Versions.typedError(messages.get(reply.requestId)!.rpc, error)
         return Effect.succeed(
           new Reply.WithExit({
             id: snowflakeGen.nextUnsafe(),
             requestId: Snowflake.Snowflake(reply.requestId),
-            exit: Exit.die(error)
+            exit: typed === undefined ? Exit.die(error) : Exit.fail(typed)
           })
         )
       }
