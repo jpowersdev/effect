@@ -36,6 +36,16 @@ export interface Allow {
 }
 
 /**
+ * Why a request was denied: a signed-in caller's reason, or `Unauthenticated`
+ * when the caller is a guest.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.3
+ */
+export type DenyReason = PermissionError.DenyReason | "Unauthenticated"
+
+/**
  * A denied request, with the reason.
  *
  * @stability experimental
@@ -45,7 +55,7 @@ export interface Allow {
 export interface Deny {
   readonly _tag: "Deny"
   readonly action: string
-  readonly reason: PermissionError.DenyReason
+  readonly reason: DenyReason
 }
 
 /**
@@ -77,7 +87,7 @@ export const allow = (action: string, condition: Condition.Condition<any> = Cond
  * @category constructors
  * @since 4.1.3
  */
-export const deny = (action: string, reason: PermissionError.DenyReason): Decision => ({
+export const deny = (action: string, reason: DenyReason): Decision => ({
   _tag: "Deny",
   action,
   reason
@@ -91,6 +101,19 @@ export const deny = (action: string, reason: PermissionError.DenyReason): Decisi
  * @since 4.1.3
  */
 export const isAllow = (self: Decision): self is Allow => self._tag === "Allow"
+
+/**
+ * Converts a denial into the error to fail with: `Unauthenticated` (401) for
+ * guests, `PermissionDenied` (403) otherwise.
+ *
+ * @stability experimental
+ * @category conversions
+ * @since 4.1.3
+ */
+export const toError = (self: Deny): PermissionError.Unauthenticated | PermissionError.PermissionDenied =>
+  self.reason === "Unauthenticated"
+    ? new PermissionError.Unauthenticated({ action: self.action })
+    : new PermissionError.PermissionDenied({ action: self.action, reason: self.reason })
 
 /**
  * A request to check one resource.
@@ -231,8 +254,8 @@ const expand = (
  * **Details**
  *
  * - Guests are denied and system principals are allowed every action.
- * - Each of the principal's limits is expanded through the action groups and
- *   must include the action.
+ * - Each of the principal's limits is expanded through the aliases and must
+ *   include the action.
  * - `forbid` overrides `filter` and `check`.
  * - Every decision is recorded on the current span as `permission.action`,
  *   `permission.decision`, and `permission.reason`.
@@ -272,7 +295,7 @@ export const make = <I, A, U extends Permission.Any>(
         return deny(action, "NoPermission")
       }
       for (const limit of principal.limits) {
-        if (!expand(permissions.actionGroups, limit).has(action)) {
+        if (!expand(permissions.aliases, limit).has(action)) {
           return deny(action, "Limit")
         }
       }

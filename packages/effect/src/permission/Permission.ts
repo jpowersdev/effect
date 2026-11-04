@@ -6,8 +6,9 @@
  * whose methods check the principal provided by the application:
  *
  * - `can` returns a decision without failing, for UI affordances.
- * - `require` fails with `PermissionDenied` unless the action is allowed, and
- *   returns the resource branded as {@link Authorized}.
+ * - `require` fails unless the action is allowed, with `Unauthenticated` for
+ *   guests and `PermissionDenied` otherwise, and returns the resource branded
+ *   as {@link Authorized}.
  * - `filter` returns the condition a resource must satisfy, for list queries.
  * - `create` and `update` apply `set` presets and check the written value.
  * - `Required` is the annotation key that the HttpApi and RPC middleware read.
@@ -53,7 +54,7 @@ import type * as Schema from "../Schema.ts"
 import type * as Types from "../Types.ts"
 import * as Authorizer from "./Authorizer.ts"
 import * as Condition from "./Condition.ts"
-import * as PermissionError from "./PermissionError.ts"
+import type * as PermissionError from "./PermissionError.ts"
 import type * as Principal from "./Principal.ts"
 
 const RulesTypeId = "~effect/permission/Permission/Rules" as const
@@ -381,9 +382,9 @@ export interface Permissions<I, A, U extends Any> {
    */
   readonly actions: ReadonlyMap<string, Action>
   /**
-   * Action groups, by name.
+   * The actions each alias stands for, by alias.
    */
-  readonly actionGroups: ReadonlyMap<string, ReadonlyArray<string>>
+  readonly aliases: ReadonlyMap<string, ReadonlyArray<string>>
   /**
    * An in-process authorizer for these rules.
    */
@@ -397,8 +398,8 @@ export interface Permissions<I, A, U extends Any> {
     resource: ResourceOf<U, Ac>
   ): Effect.Effect<Authorizer.Decision, PermissionError.PermissionUnavailable, I | Authorizer.Authorizer>
   /**
-   * Fails with `PermissionDenied` unless the principal may perform the action
-   * on the resource.
+   * Fails unless the principal may perform the action on the resource:
+   * `Unauthenticated` for guests, `PermissionDenied` otherwise.
    */
   require<Ac extends ActionsOf<U>, Resource extends ResourceOf<U, Ac>>(
     action: Ac,
@@ -442,9 +443,9 @@ const merge = (base: object, ...parts: ReadonlyArray<object>): any =>
  *
  * **Details**
  *
- * `actionGroups` names groups of actions for principal limits: if a limit
- * includes a group's name, it includes every action in the group. Groups may
- * contain other groups.
+ * `aliases` names lists of actions for principal limits: if a limit includes
+ * an alias, it includes every action the alias stands for. Aliases may stand
+ * for other aliases.
  *
  * Declaring the same action in two rule sets is a defect.
  *
@@ -456,7 +457,7 @@ export const make = <I, A, const Rs extends ReadonlyArray<Any>>(
   principal: Context.Key<I, Principal.Principal<A>>,
   options: {
     readonly rules: Rs
-    readonly actionGroups?: Readonly<Record<string, ReadonlyArray<string>>> | undefined
+    readonly aliases?: Readonly<Record<string, ReadonlyArray<string>>> | undefined
   }
 ): Permissions<I, A, Rs[number]> => {
   const actions = new Map<string, Action>()
@@ -466,7 +467,7 @@ export const make = <I, A, const Rs extends ReadonlyArray<Any>>(
       actions.set(name, action)
     }
   }
-  const actionGroups = new Map(Object.entries(options.actionGroups ?? {}))
+  const aliases = new Map(Object.entries(options.aliases ?? {}))
 
   const decide = Effect.fnUntraced(function*(method: "check" | "checkWrite", action: string, resource: unknown) {
     const authorizer = yield* Authorizer.Authorizer
@@ -474,9 +475,7 @@ export const make = <I, A, const Rs extends ReadonlyArray<Any>>(
   })
 
   const orDeny = (decision: Authorizer.Decision) =>
-    decision._tag === "Deny"
-      ? Effect.fail(new PermissionError.PermissionDenied({ action: decision.action, reason: decision.reason }))
-      : Effect.void
+    decision._tag === "Deny" ? Effect.fail(Authorizer.toError(decision)) : Effect.void
 
   const presets = (name: string, current: Principal.Principal<A>): object => {
     const set = actions.get(name)?.set
@@ -489,7 +488,7 @@ export const make = <I, A, const Rs extends ReadonlyArray<Any>>(
     principal,
     Required: Context.Reference<any>(`${principal.key}/Required`, { defaultValue: () => undefined }),
     actions,
-    actionGroups,
+    aliases,
     get layer() {
       return Authorizer.layer(self)
     },

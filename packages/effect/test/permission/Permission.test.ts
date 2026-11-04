@@ -23,7 +23,9 @@ const as =
     Effect.provide(Effect.provideService(effect, CurrentPrincipal, principal), TestLayer)
 
 const denial = <A>(effect: Effect.Effect<A, unknown>) =>
-  Effect.flip(effect).pipe(Effect.map((error: any) => `${error._tag}:${error.reason}`))
+  Effect.flip(effect).pipe(
+    Effect.map((error: any) => error._tag === "PermissionDenied" ? `${error._tag}:${error.reason}` : error._tag)
+  )
 
 describe("Permission", () => {
   describe("require", () => {
@@ -44,7 +46,7 @@ describe("Permission", () => {
         const [u1] = units
         assert.strictEqual(
           yield* denial(Permissions.require("units:read", u1).pipe(as(Principal.guest))),
-          "PermissionDenied:Unauthenticated"
+          "Unauthenticated"
         )
         assert.strictEqual(yield* Permissions.require("units:read", u1).pipe(as(Principal.system("nightly-sync"))), u1)
       }))
@@ -60,7 +62,7 @@ describe("Permission", () => {
         )
       }))
 
-    it.effect("applies limits, expanded through action groups", () =>
+    it.effect("applies limits, expanded through aliases", () =>
       Effect.gen(function*() {
         const viaText = Principal.withLimit(nurse, ["swaps:respond"])
         yield* Permissions.require("swaps:accept", swap({})).pipe(as(viaText))

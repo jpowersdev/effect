@@ -4,9 +4,10 @@
  *
  * {@link table} maps a resource schema to its table and columns, and
  * {@link relation} maps a `Condition.Relation` to the table that stores its
- * facts. {@link where} compiles a simplified condition into a
- * `Statement.Fragment`; {@link filter} does that for an action's plan, so a
- * list query returns only what the principal may see.
+ * facts. {@link Service} declares the application's service: its layer closes
+ * over the SQL client and the mappings, its `filter` compiles an action's plan
+ * into a `Statement.Fragment` so a list query returns only what the principal
+ * may see, and it answers the authorizer's relation lookups.
  *
  * **Details**
  *
@@ -22,8 +23,16 @@
  * **Example** (Filtering a list query)
  *
  * ```ts
- * const visible = yield* PermissionSql.filter(Permissions, "units:read")
- * const units = yield* sql`SELECT * FROM unit WHERE ${visible} ORDER BY name`
+ * class PermissionsSql extends PermissionSql.Service<PermissionsSql>()("app/PermissionsSql", {
+ *   permissions: Permissions,
+ *   tables: [PermissionSql.table(Unit, "units")],
+ *   relations: [PermissionSql.relation(UnitMembership, { table: "profile_units", subject: "profile_id", object: "unit_id" })]
+ * }) {}
+ *
+ * // In a repository built with `PermissionsSql.layer` available
+ * const permissionsSql = yield* PermissionsSql
+ * const visible = yield* permissionsSql.filter("units:read")
+ * const units = yield* sql`SELECT * FROM units WHERE ${visible} ORDER BY name`
  * ```
  *
  * @stability experimental
@@ -98,21 +107,6 @@ export const relation = (
     readonly object: string
   }
 ): RelationTable => ({ relation, ...options })
-
-/**
- * The table mappings used by {@link filter} and the SQL relation store.
- *
- * @stability experimental
- * @category services
- * @since 4.1.3
- */
-export class Mappings extends Context.Service<
-  Mappings,
-  {
-    readonly tables: ReadonlyMap<Schema.Top, Table>
-    readonly relations: ReadonlyMap<Condition.Relation<any, any>, RelationTable>
-  }
->()("effect/permission/PermissionSql/Mappings") {}
 
 // -----------------------------------------------------------------------------
 // Compilation
@@ -247,91 +241,141 @@ export const where = (
     )
   )
 
+// -----------------------------------------------------------------------------
+// Service
+// -----------------------------------------------------------------------------
+
 /**
- * Compiles the plan for an action into a SQL fragment for the action's
- * resource table, using the mappings from {@link layer}.
+ * The operations of a {@link Service}.
+ *
+ * **Details**
+ *
+ * - `filter` compiles the plan for an action into a fragment for the action's
+ *   resource table. It needs only the principal and the authorizer, which the
+ *   authorization middleware provides.
+ * - `where` compiles any condition over a resource's fields.
+ * - `related` looks up one relation fact in its table.
  *
  * @stability experimental
- * @category compilation
+ * @category models
  * @since 4.1.3
  */
-export const filter = <I, A, U extends Permission.Any, Ac extends Permission.ActionsOf<U>>(
+export interface Shape<I, U extends Permission.Any> {
+  readonly filter: <Ac extends Permission.ActionsOf<U>>(
+    action: Ac
+  ) => Effect.Effect<Statement.Fragment, PermissionError.PermissionUnavailable, I | Authorizer.Authorizer>
+  readonly where: (condition: Condition.Condition<any>, resource: Schema.Top) => Effect.Effect<Statement.Fragment>
+  readonly related: Authorizer.RelationStore["has"]
+}
+
+/**
+ * Creates the operations of a {@link Service}, closing over the SQL client.
+ *
+ * **When to use**
+ *
+ * Use to build a service of your own instead of declaring one with
+ * {@link Service}.
+ *
+ * @stability experimental
+ * @category constructors
+ * @since 4.1.3
+ */
+export const make = <I, A, U extends Permission.Any>(
   permissions: Permission.Permissions<I, A, U>,
-  action: Ac
-): Effect.Effect<Statement.Fragment, PermissionError.PermissionUnavailable, I | Authorizer.Authorizer | Mappings> =>
+  options: {
+    readonly tables: Iterable<Table<any>>
+    readonly relations?: Iterable<RelationTable> | undefined
+  }
+): Effect.Effect<Shape<I, U>, never, SqlClient.SqlClient> =>
   Effect.gen(function*() {
-    const condition = yield* permissions.filter(action)
-    const mappings = yield* Mappings
-    const resource = permissions.actions.get(action)!.resource
-    const mapping = mappings.tables.get(resource)
-    if (mapping === undefined) {
-      return yield* Effect.die(new Error(`PermissionSql.filter: no table for the resource of "${action}"`))
+    const sql = yield* SqlClient.SqlClient
+    const tables = new Map(Array.from(options.tables, (mapping) => [mapping.resource, mapping] as const))
+    const relations = new Map(Array.from(options.relations ?? [], (mapping) => [mapping.relation, mapping] as const))
+
+    const tableFor = (resource: Schema.Top, label: string): Table => {
+      const mapping = tables.get(resource)
+      if (mapping === undefined) throw new Error(`PermissionSql: no table for the resource of ${label}`)
+      return mapping
     }
-    return yield* Effect.sync(() => compile(condition, mapping, mappings.relations))
+
+    const where = (condition: Condition.Condition<any>, resource: Schema.Top) =>
+      Effect.sync(() => compile(condition, tableFor(resource, "this condition"), relations))
+
+    const filter = Effect.fnUntraced(function*(action: string) {
+      const condition = yield* permissions.filter(action as Permission.ActionsOf<U>)
+      const resource = permissions.actions.get(action)!.resource
+      return yield* Effect.sync(() => compile(condition, tableFor(resource, `"${action}"`), relations))
+    })
+
+    const related: Authorizer.RelationStore["has"] = (relation, subject, object) => {
+      const mapping = relations.get(relation)
+      if (mapping === undefined) {
+        return Effect.logWarning(`No table is mapped for relation "${relation.name}"`).pipe(
+          Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
+        )
+      }
+      return sql<{ readonly found: number }>`SELECT 1 AS found FROM ${sql(mapping.table)} WHERE ${
+        sql(mapping.subject)
+      } = ${subject} AND ${sql(mapping.object)} = ${object} LIMIT 1`.pipe(
+        Effect.map((rows) => rows.length > 0),
+        Effect.catchTag("SqlError", (error) =>
+          Effect.logWarning(`Looking up relation "${relation.name}" failed`, error).pipe(
+            Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
+          ))
+      )
+    }
+
+    return { filter, where, related } as Shape<I, U>
   })
 
-const makeMappings = (options: {
-  readonly tables: Iterable<Table<any>>
-  readonly relations?: Iterable<RelationTable> | undefined
-}): Mappings["Service"] => ({
-  tables: new Map(Array.from(options.tables, (mapping) => [mapping.resource, mapping] as const)),
-  relations: new Map(Array.from(options.relations ?? [], (mapping) => [mapping.relation, mapping] as const))
-})
-
 /**
- * Provides only the table mappings, for compiling filters when relation facts
- * are looked up elsewhere.
+ * A service class created by {@link Service}.
  *
  * @stability experimental
- * @category layers
+ * @category models
  * @since 4.1.3
  */
-export const layerMappings = (options: {
-  readonly tables: Iterable<Table<any>>
-  readonly relations?: Iterable<RelationTable> | undefined
-}): Layer.Layer<Mappings> => Layer.succeed(Mappings, makeMappings(options))
+export type ServiceClass<Self, Id extends string, I, U extends Permission.Any> =
+  & Context.ServiceClass<Self, Id, Shape<I, U>>
+  & {
+    /**
+     * Provides the service, and the relation store the authorizer uses for
+     * relation lookups. Requires a `SqlClient`.
+     */
+    readonly layer: Layer.Layer<Self, never, SqlClient.SqlClient>
+  }
 
 /**
- * Provides the table mappings, and a relation store that looks up relation
- * facts in their SQL tables.
+ * Declares the application's SQL permission service for a `Permissions`
+ * object and its table mappings.
+ *
+ * **Details**
+ *
+ * The service's `layer` closes over the SQL client and the mappings, so its
+ * methods never require them. It also provides the relation store, so provide
+ * it to the authorizer layer as well: `Permissions.layer.pipe(Layer.provideMerge(PermissionsSql.layer))`.
  *
  * @stability experimental
- * @category layers
+ * @category constructors
  * @since 4.1.3
  */
-export const layer = (options: {
-  readonly tables: Iterable<Table<any>>
-  readonly relations?: Iterable<RelationTable> | undefined
-}): Layer.Layer<Mappings, never, SqlClient.SqlClient> => {
-  const mappings = makeMappings(options)
-  const relations = mappings.relations
+export const Service = <Self>() =>
+<const Id extends string, I, A, U extends Permission.Any>(
+  id: Id,
+  options: {
+    readonly permissions: Permission.Permissions<I, A, U>
+    readonly tables: Iterable<Table<any>>
+    readonly relations?: Iterable<RelationTable> | undefined
+  }
+): ServiceClass<Self, Id, I, U> => {
+  /** @effect-diagnostics-next-line classSelfMismatch:off */
+  class PermissionSqlService extends Context.Service<Self, Shape<I, U>>()(id) {}
+  const service = Layer.effect(PermissionSqlService, make(options.permissions, options))
   const store = Layer.effect(
     Authorizer.Relations,
-    Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
-      return {
-        has: (relation, subject, object) => {
-          const mapping = relations.get(relation)
-          if (mapping === undefined) {
-            return Effect.logWarning(`No table is mapped for relation "${relation.name}"`).pipe(
-              Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
-            )
-          }
-          return sql<{ readonly found: number }>`SELECT 1 AS found FROM ${sql(mapping.table)} WHERE ${
-            sql(mapping.subject)
-          } = ${subject} AND ${sql(mapping.object)} = ${object} LIMIT 1`.pipe(
-            Effect.map((rows) => rows.length > 0),
-            Effect.catchTag(
-              "SqlError",
-              (error) =>
-                Effect.logWarning(`Looking up relation "${relation.name}" failed`, error).pipe(
-                  Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
-                )
-            )
-          )
-        }
-      } satisfies Authorizer.RelationStore
-    })
+    Effect.map(PermissionSqlService, (self): Authorizer.RelationStore => ({ has: self.related }))
   )
-  return Layer.merge(Layer.succeed(Mappings, mappings), store)
+  return Object.assign(PermissionSqlService, {
+    layer: store.pipe(Layer.provideMerge(service))
+  }) as any
 }

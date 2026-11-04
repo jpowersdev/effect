@@ -3,12 +3,12 @@
  *
  * Declare an ordinary `HttpApiMiddleware` that requires the application's
  * principal, provides the `Authorizer` to handlers, and fails with
- * `PermissionError.PermissionDenied` and `PermissionError.PermissionUnavailable`.
+ * `PermissionError.PermissionError`: 401 for guests, 403 for callers who
+ * aren't allowed, and 503 when a decision can't be made.
  * Annotate each endpoint or group with the action it requires using
  * `Permissions.Required`, or with `Permission.Public`. {@link layer} implements
  * the middleware. Because the middleware declares those errors, handlers may
- * fail with `PermissionDenied` too, so `Permissions.require` works inside
- * handlers.
+ * fail with them too, so `Permissions.require` works inside handlers.
  *
  * **Details**
  *
@@ -30,7 +30,7 @@
  *     provides: Authorizer.Authorizer
  *   }
  * >()("app/Authorize", {
- *   error: [PermissionError.PermissionDenied, PermissionError.PermissionUnavailable]
+ *   error: PermissionError.PermissionError
  * }) {}
  * ```
  *
@@ -151,7 +151,7 @@ export const layer = <
           }
           const decision = yield* authorizer.plan({ principal: yield* permissions.principal, action: required })
           if (decision._tag === "Deny") {
-            return yield* new PermissionError.PermissionDenied({ action: required, reason: decision.reason })
+            return yield* Authorizer.toError(decision)
           }
           return yield* handler
         }
