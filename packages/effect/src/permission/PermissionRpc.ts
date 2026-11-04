@@ -121,7 +121,7 @@ export const layer = <Self, I, A, U extends Permission.Any, Rpcs extends Rpc.Any
             }
             const decision = yield* authorizer.plan({ principal: yield* permissions.principal, action: required })
             if (decision._tag === "Deny") {
-              return yield* new PermissionError.PermissionDenied({ action: required, reason: decision.reason })
+              return yield* Authorizer.toError(decision)
             }
             return yield* handler
           }

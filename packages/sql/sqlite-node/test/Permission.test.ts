@@ -64,15 +64,18 @@ const Seeded = Layer.effectDiscard(Effect.gen(function*() {
   }`
 }))
 
+// The service closes over the SQL client and the mappings, and also answers
+// the authorizer's relation lookups
+class PermissionsSql extends PermissionSql.Service<PermissionsSql>()("test/PermissionsSql", {
+  permissions: Permissions,
+  tables: [PermissionSql.table(Unit, "unit", { hospitalId: "hospital_id" })],
+  relations: [
+    PermissionSql.relation(UnitMembership, { table: "profile_unit", subject: "profile_id", object: "unit_id" })
+  ]
+}) {}
+
 const TestLayer = Permissions.layer.pipe(
-  Layer.provideMerge(
-    PermissionSql.layer({
-      tables: [PermissionSql.table(Unit, "unit", { hospitalId: "hospital_id" })],
-      relations: [
-        PermissionSql.relation(UnitMembership, { table: "profile_unit", subject: "profile_id", object: "unit_id" })
-      ]
-    })
-  ),
+  Layer.provideMerge(PermissionsSql.layer),
   Layer.provideMerge(Seeded),
   Layer.provideMerge(SqliteClient.layer({ filename: ":memory:" })),
   Layer.provide(Reactivity.layer)
@@ -80,7 +83,7 @@ const TestLayer = Permissions.layer.pipe(
 
 const visibleUnitIds = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
-  const visible = yield* PermissionSql.filter(Permissions, "units:read")
+  const visible = yield* (yield* PermissionsSql).filter("units:read")
   const rows = yield* sql<{ readonly id: string }>`SELECT id FROM unit WHERE ${visible} ORDER BY id`
   return rows.map((row) => row.id)
 })

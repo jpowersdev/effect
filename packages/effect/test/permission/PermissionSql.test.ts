@@ -5,25 +5,23 @@ import * as Statement from "effect/sql/Statement"
 import { admin, CurrentPrincipal, memberships, nurse, Permissions, Unit, UnitMembership } from "./utils.ts"
 
 const UnitTable = PermissionSql.table(Unit, "unit", { hospitalId: "hospital_id" })
+const Memberships = PermissionSql.relation(UnitMembership, {
+  table: "profile_unit",
+  subject: "profile_id",
+  object: "unit_id"
+})
 
-const TestLayer = Layer.mergeAll(
-  Permissions.layer.pipe(Layer.provide(Authorizer.layerRelationsMemory(memberships))),
-  PermissionSql.layerMappings({
-    tables: [UnitTable],
-    relations: [
-      PermissionSql.relation(UnitMembership, { table: "profile_unit", subject: "profile_id", object: "unit_id" })
-    ]
-  })
-)
+const TestLayer = Permissions.layer.pipe(Layer.provide(Authorizer.layerRelationsMemory(memberships)))
 
 const compile = (fragment: Statement.Fragment) => Statement.makeCompilerSqlite().compile(fragment, false)
+
+const plan = (principal: typeof nurse) =>
+  Permissions.filter("units:read").pipe(Effect.provideService(CurrentPrincipal, principal))
 
 describe("PermissionSql", () => {
   it.effect("compiles a plan into a qualified, parameterized fragment", () =>
     Effect.gen(function*() {
-      const fragment = yield* PermissionSql.filter(Permissions, "units:read").pipe(
-        Effect.provideService(CurrentPrincipal, nurse)
-      )
+      const fragment = yield* PermissionSql.where(yield* plan(nurse), UnitTable, { relations: [Memberships] })
       assert.deepStrictEqual(compile(fragment), [
         `("unit"."hospital_id" = ? OR EXISTS (SELECT 1 FROM "profile_unit" AS "permission_relation_0" WHERE "permission_relation_0"."profile_id" = ? AND "permission_relation_0"."unit_id" = "unit"."id"))`,
         ["h-1", "p-nurse"]
@@ -32,10 +30,7 @@ describe("PermissionSql", () => {
 
   it.effect("compiles an unconditional plan to 1=1", () =>
     Effect.gen(function*() {
-      const fragment = yield* PermissionSql.filter(Permissions, "units:read").pipe(
-        Effect.provideService(CurrentPrincipal, admin)
-      )
-      assert.deepStrictEqual(compile(fragment), ["1=1", []])
+      assert.deepStrictEqual(compile(yield* PermissionSql.where(yield* plan(admin), UnitTable)), ["1=1", []])
     }).pipe(Effect.provide(TestLayer)))
 
   it.effect("denies by default when nothing can match", () =>

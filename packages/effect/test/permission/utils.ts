@@ -79,7 +79,7 @@ export const SwapRules = Permission.rules(CurrentPrincipal, SwapRequest, {
 
 export const Permissions = Permission.make(CurrentPrincipal, {
   rules: [UnitRules, SwapRules],
-  actionGroups: {
+  aliases: {
     "swaps:respond": ["swaps:read", "swaps:accept"]
   }
 })

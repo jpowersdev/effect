@@ -17,7 +17,7 @@ class Authorize extends HttpApiMiddleware.Service<
     provides: Authorizer.Authorizer
   }
 >()("test/permission/Authorize", {
-  error: [PermissionError.PermissionDenied, PermissionError.PermissionUnavailable]
+  error: PermissionError.PermissionError
 }) {}
 
 const UnitsGroup = HttpApiGroup.make("units")
@@ -94,13 +94,13 @@ describe("PermissionHttpApi", () => {
       assert.instanceOf(error, PermissionError.PermissionDenied)
     }))
 
-  it.effect("lets public endpoints through for guests", () =>
+  it.effect("lets guests through to public endpoints and answers 401 elsewhere", () =>
     Effect.gen(function*() {
       const api = yield* client(Principal.guest)
       assert.strictEqual(yield* api.units.health(), "ok")
       const error = yield* Effect.flip(api.units.list())
-      assert.instanceOf(error, PermissionError.PermissionDenied)
-      assert.strictEqual(error.reason, "Unauthenticated")
+      assert.instanceOf(error, PermissionError.Unauthenticated)
+      assert.strictEqual(error.action, "units:read")
     }))
 
   it.effect("fails to start when an endpoint is not covered", () =>
