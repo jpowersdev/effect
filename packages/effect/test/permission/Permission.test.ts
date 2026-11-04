@@ -99,6 +99,12 @@ describe("Permission", () => {
         assert.isTrue(Condition.isAlways(yield* Permissions.filter("units:read").pipe(as(admin))))
       }))
 
+    it.effect("plans create-only actions from their check", () =>
+      Effect.gen(function*() {
+        assert.isFalse(Condition.isNever(yield* Permissions.filter("swaps:create").pipe(as(nurse))))
+        assert.isTrue(Condition.isNever(yield* Permissions.filter("swaps:create").pipe(as(Principal.guest))))
+      }))
+
     it.effect("returns never when the principal could never pass", () =>
       Effect.gen(function*() {
         assert.isTrue(Condition.isNever(yield* Permissions.filter("units:update").pipe(as(nurse))))
