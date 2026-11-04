@@ -614,8 +614,8 @@ export const not = <R>(input: Input<R>): Condition<R> => make<Not<R>>({ _tag: "N
  */
 export const related = <Subject, Object>(
   relation: Relation<Subject, Object>,
-  subject: Operand<Unbrand<Subject>>,
-  object: Operand<Unbrand<Object>>
+  subject: Operand<Unbrand<NoInfer<Subject>>>,
+  object: Operand<Unbrand<NoInfer<Object>>>
 ): Condition => make<Related>({ _tag: "Related", relation, subject, object })
 
 /**
