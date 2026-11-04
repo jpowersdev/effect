@@ -2,7 +2,8 @@
  * The errors permission checks fail with, as Schema errors so they can be
  * declared on HttpApi endpoints and RPCs and decoded by clients.
  *
- * Declare {@link PermissionError} as the error of an authorization middleware.
+ * Declare {@link errors} as the error of an HttpApi authorization middleware,
+ * and {@link PermissionError} as the error of an RPC one.
  * A guest asking for a protected action fails with {@link Unauthenticated}
  * (401); a signed-in caller who isn't allowed fails with
  * {@link PermissionDenied} (403).
@@ -85,8 +86,23 @@ export class PermissionUnavailable
 {}
 
 /**
- * Every permission error, as one schema, for middleware that accepts a single
- * error schema.
+ * Every permission error, as a list of schemas, for `HttpApiMiddleware`.
+ *
+ * **Gotchas**
+ *
+ * Declare the list, not the {@link PermissionError} union, on HttpApi
+ * middleware: a union schema loses each error's HTTP status and responds with
+ * 500.
+ *
+ * @stability experimental
+ * @category schemas
+ * @since 4.1.3
+ */
+export const errors = [Unauthenticated, PermissionDenied, PermissionUnavailable] as const
+
+/**
+ * Every permission error, as one schema, for `RpcMiddleware`, which accepts a
+ * single error schema.
  *
  * @stability experimental
  * @category schemas
