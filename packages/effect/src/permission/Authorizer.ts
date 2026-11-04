@@ -115,8 +115,9 @@ export interface Request {
  * - `checkWrite` decides whether a resource may be written as given, using the
  *   action's `check` rule (or its `filter` when it has no `check`) and its
  *   `forbid` rule.
- * - `plan` decides which resources the principal may perform the action on. An
- *   allowed plan's condition refers only to resource fields.
+ * - `plan` decides which resources the principal may perform the action on,
+ *   using the action's `filter`, or its `check` for actions that only create
+ *   resources. An allowed plan's condition refers only to resource fields.
  *
  * @stability experimental
  * @category services
@@ -308,11 +309,14 @@ export const make = <I, A, U extends Permission.Any>(
         if ("_tag" in entry) {
           return entry
         }
-        if (entry.filter === undefined) {
+        // Actions that only create resources have no filter; their check says
+        // which resources the principal could create
+        const condition = entry.filter ?? entry.check
+        if (condition === undefined) {
           return deny(request.action, "NoPermission")
         }
         const residual = Condition.simplify(
-          entry.forbid === undefined ? entry.filter : Condition.and(entry.filter, Condition.not(entry.forbid)),
+          entry.forbid === undefined ? condition : Condition.and(condition, Condition.not(entry.forbid)),
           request.principal
         )
         if (!Condition.isNever(residual)) {
