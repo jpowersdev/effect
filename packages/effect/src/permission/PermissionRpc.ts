@@ -54,8 +54,8 @@ import * as PermissionError from "./PermissionError.ts"
  * @category validation
  * @since 4.1.3
  */
-export const validate = <I, A, U extends Permission.Any>(
-  group: RpcGroup.RpcGroup<any>,
+export const validate = <I, A, U extends Permission.Any, Rpcs extends Rpc.Any>(
+  group: RpcGroup.RpcGroup<Rpcs>,
   middleware: Context.Key<any, any>,
   permissions: Permission.Permissions<I, A, U>
 ): ReadonlyArray<string> => {
@@ -93,11 +93,11 @@ export const validate = <I, A, U extends Permission.Any>(
  * @category layers
  * @since 4.1.3
  */
-export const layer = <Self, I, A, U extends Permission.Any>(
+export const layer = <Self, I, A, U extends Permission.Any, Rpcs extends Rpc.Any = never>(
   middleware: Context.Key<Self, any>,
   permissions: Permission.Permissions<I, A, U>,
   options?: {
-    readonly group?: RpcGroup.RpcGroup<any> | undefined
+    readonly group?: RpcGroup.RpcGroup<Rpcs> | undefined
   }
 ): Layer.Layer<Self, never, Authorizer.Authorizer> =>
   Layer.effect(
