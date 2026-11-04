@@ -40,6 +40,7 @@
 import * as Context from "../Context.ts"
 import * as Effect from "../Effect.ts"
 import * as HttpApi from "../http-api/HttpApi.ts"
+import type * as HttpApiGroup from "../http-api/HttpApiGroup.ts"
 import type * as HttpApiMiddleware from "../http-api/HttpApiMiddleware.ts"
 import * as Layer from "../Layer.ts"
 import * as Authorizer from "./Authorizer.ts"
@@ -67,8 +68,8 @@ const requiredFor = <I, A, U extends Permission.Any>(
  * @category validation
  * @since 4.1.3
  */
-export const validate = <I, A, U extends Permission.Any>(
-  api: HttpApi.HttpApi<string, any>,
+export const validate = <I, A, U extends Permission.Any, ApiId extends string, Groups extends HttpApiGroup.Constraint>(
+  api: HttpApi.HttpApi<ApiId, Groups>,
   middleware: Context.Key<any, any>,
   permissions: Permission.Permissions<I, A, U>
 ): ReadonlyArray<string> => {
@@ -113,11 +114,18 @@ export const validate = <I, A, U extends Permission.Any>(
  * @category layers
  * @since 4.1.3
  */
-export const layer = <Self, I, A, U extends Permission.Any>(
+export const layer = <
+  Self,
+  I,
+  A,
+  U extends Permission.Any,
+  ApiId extends string = string,
+  Groups extends HttpApiGroup.Constraint = never
+>(
   middleware: Context.Key<Self, any>,
   permissions: Permission.Permissions<I, A, U>,
   options?: {
-    readonly api?: HttpApi.HttpApi<string, any> | undefined
+    readonly api?: HttpApi.HttpApi<ApiId, Groups> | undefined
   }
 ): Layer.Layer<Self, never, Authorizer.Authorizer> =>
   Layer.effect(
