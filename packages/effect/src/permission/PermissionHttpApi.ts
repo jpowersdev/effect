@@ -3,8 +3,8 @@
  *
  * Declare an ordinary `HttpApiMiddleware` that requires the application's
  * principal, provides the `Authorizer` to handlers, and fails with
- * `PermissionError.PermissionError`: 401 for guests, 403 for callers who
- * aren't allowed, and 503 when a decision can't be made.
+ * `PermissionError.errors`: 401 for guests, 403 for callers who aren't
+ * allowed, and 503 when a decision can't be made.
  * Annotate each endpoint or group with the action it requires using
  * `Permissions.Required`, or with `Permission.Public`. {@link layer} implements
  * the middleware. Because the middleware declares those errors, handlers may
@@ -30,7 +30,7 @@
  *     provides: Authorizer.Authorizer
  *   }
  * >()("app/Authorize", {
- *   error: PermissionError.PermissionError
+ *   error: PermissionError.errors
  * }) {}
  * ```
  *

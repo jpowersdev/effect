@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Exit, FileSystem, Layer, Path, Schema } from "effect"
-import { Etag, HttpPlatform } from "effect/http"
+import { Etag, HttpPlatform, HttpRouter } from "effect/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiTest } from "effect/http-api"
 import { Authorizer, Permission, PermissionError, PermissionHttpApi, Principal } from "effect/permission"
 import { CurrentPrincipal, manager, type Member, memberships, nurse, Permissions, Unit, units } from "./utils.ts"
@@ -17,7 +17,7 @@ class Authorize extends HttpApiMiddleware.Service<
     provides: Authorizer.Authorizer
   }
 >()("test/permission/Authorize", {
-  error: PermissionError.PermissionError
+  error: PermissionError.errors
 }) {}
 
 const UnitsGroup = HttpApiGroup.make("units")
@@ -102,6 +102,41 @@ describe("PermissionHttpApi", () => {
       assert.instanceOf(error, PermissionError.Unauthenticated)
       assert.strictEqual(error.action, "units:read")
     }))
+
+  it("responds with 401 for guests and 403 for callers who aren't allowed", async () => {
+    const status = async (principal: Principal.Principal<Member>, path: string, init?: RequestInit) => {
+      const { dispose, handler } = HttpRouter.toWebHandler(
+        HttpApiBuilder.layer(Api).pipe(
+          Layer.provide(UnitsLive),
+          Layer.provide(PermissionHttpApi.layer(Authorize, Permissions, { api: Api })),
+          Layer.provide(
+            Layer.succeed(
+              Authentication,
+              (httpEffect) => Effect.provideService(httpEffect, CurrentPrincipal, principal)
+            )
+          ),
+          Layer.provide(Permissions.layer.pipe(Layer.provide(Authorizer.layerRelationsMemory(memberships)))),
+          Layer.provide(TestServices)
+        ),
+        { disableLogger: true }
+      )
+      try {
+        return (await handler(new Request(`http://localhost${path}`, init))).status
+      } finally {
+        await dispose()
+      }
+    }
+    assert.strictEqual(await status(Principal.guest, "/units"), 401)
+    assert.strictEqual(
+      await status(nurse, "/units/u-1", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "x" })
+      }),
+      403
+    )
+    assert.strictEqual(await status(nurse, "/units"), 200)
+  })
 
   it.effect("fails to start when an endpoint is not covered", () =>
     Effect.gen(function*() {
