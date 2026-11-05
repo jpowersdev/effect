@@ -46,12 +46,11 @@ describe("PermissionSql", () => {
 
   it.effect("refuses to compile custom conditions and principal references", () =>
     Effect.gen(function*() {
-      const rules = Permission.rules(CurrentPrincipal, Unit, {
-        "units:audit": { filter: () => Condition.custom("audit", () => Effect.succeed(true)) },
-        "units:raw": {
+      const rules = Permission.rules(CurrentPrincipal, Unit)
+        .action("units:audit", { filter: () => Condition.custom("audit", () => Effect.succeed(true)) })
+        .action("units:raw", {
           filter: ({ principal, resource }) => Condition.eq(resource.hospitalId, principal.attributes.homeHospitalId)
-        }
-      })
+        })
       for (const action of ["units:audit", "units:raw"]) {
         const exit = yield* Effect.exit(PermissionSql.where(rules.actions.get(action)!.filter!, UnitTable))
         assert.isTrue(Exit.hasDies(exit), action)

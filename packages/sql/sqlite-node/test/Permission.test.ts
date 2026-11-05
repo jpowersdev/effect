@@ -24,15 +24,13 @@ const UnitMembership = Condition.relation<string, string>("unit:member")
 
 const Permissions = Permission.make(CurrentPrincipal, {
   rules: [
-    Permission.rules(CurrentPrincipal, Unit, {
-      "units:read": {
-        filter: ({ principal, resource: unit }) =>
-          Condition.or(
-            principal.attributes.isSuperAdmin,
-            Condition.eq(unit.hospitalId, principal.attributes.homeHospitalId),
-            Condition.related(UnitMembership, principal.subject.id, unit.id)
-          )
-      }
+    Permission.rules(CurrentPrincipal, Unit).action("units:read", {
+      filter: ({ principal, resource: unit }) =>
+        Condition.or(
+          principal.attributes.isSuperAdmin,
+          Condition.eq(unit.hospitalId, principal.attributes.homeHospitalId),
+          Condition.related(UnitMembership, principal.subject.id, unit.id)
+        )
     })
   ]
 })

@@ -29,23 +29,22 @@ export class CurrentPrincipal extends Context.Service<
 
 export const UnitMembership = Condition.relation<string, string>("unit:member")
 
-export const UnitRules = Permission.rules(CurrentPrincipal, Unit, {
-  "units:read": {
+export const UnitRules = Permission.rules(CurrentPrincipal, Unit)
+  .action("units:read", {
     filter: ({ principal, resource: unit }) =>
       Condition.or(
         principal.attributes.isSuperAdmin,
         Condition.eq(unit.hospitalId, principal.attributes.homeHospitalId),
         Condition.related(UnitMembership, principal.subject.id, unit.id)
       )
-  },
-  "units:update": {
+  })
+  .action("units:update", {
     filter: ({ principal, allowed }) => Condition.and(allowed("units:read"), principal.attributes.managesUnits),
     check: ({ allowed }) => allowed("units:read")
-  }
-})
+  })
 
-export const SwapRules = Permission.rules(CurrentPrincipal, SwapRequest, {
-  "swaps:read": {
+export const SwapRules = Permission.rules(CurrentPrincipal, SwapRequest)
+  .action("swaps:read", {
     filter: ({ principal, resource: swap }) =>
       Condition.or(
         Condition.eq(swap.requesterId, principal.subject.id),
@@ -55,16 +54,16 @@ export const SwapRules = Permission.rules(CurrentPrincipal, SwapRequest, {
           Condition.related(UnitMembership, principal.subject.id, swap.unitId)
         )
       )
-  },
-  "swaps:create": {
+  })
+  .create("swaps:create", {
     set: ({ principal }) => ({ requesterId: principal.subject.id, status: "pending" }),
     check: ({ principal, resource: swap }) => Condition.related(UnitMembership, principal.subject.id, swap.unitId)
-  },
-  "swaps:accept": {
+  })
+  .action("swaps:accept", {
     filter: ({ principal, resource: swap }) =>
       Condition.and(Condition.eq(swap.recipientId, principal.subject.id), Condition.eq(swap.status, "pending"))
-  },
-  "swaps:approve": {
+  })
+  .action("swaps:approve", {
     filter: ({ principal, resource: swap }) =>
       Condition.and(
         Condition.eq(swap.status, "accepted"),
@@ -74,8 +73,7 @@ export const SwapRules = Permission.rules(CurrentPrincipal, SwapRequest, {
       ),
     // Support staff can look while impersonating, but not approve
     forbid: ({ principal }) => Condition.isNotNull(principal.actor)
-  }
-})
+  })
 
 export const Permissions = Permission.make(CurrentPrincipal, {
   rules: [UnitRules, SwapRules],
