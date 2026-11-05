@@ -14,8 +14,8 @@
  * - `filter` returns the condition a resource must satisfy, for list queries.
  * - `create` builds the value a create action writes, from the payload and the
  *   action's `set` presets, then checks it.
- * - `update` applies a patch and the action's `set` presets, checking the
- *   resource before and after.
+ * - `update` builds the value an update writes, from the resource, a patch,
+ *   and the action's `set` presets, checking the resource before and after.
  * - `Required` is the annotation key that the HttpApi and RPC middleware read.
  *
  * **Example** (Requiring a permission)
@@ -148,11 +148,51 @@ export type RequiredPresets<S extends Schema.Top> = Pick<
   Exclude<RequiredKeys<MakeIn<CreateSchema<S>>>, keyof CreatePayload<S>>
 >
 
+/**
+ * The schema `update` builds a resource with: the `update` variant of a
+ * `Model` class, or the resource schema itself.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type UpdateSchema<S extends Schema.Top> = S extends Model.Any ? S["update"] : S
+
+/**
+ * What a caller provides to update a resource: the `jsonUpdate` variant of a
+ * `Model` class, or the constructor input of the resource schema. `update`
+ * takes any part of it.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type UpdatePayload<S extends Schema.Top> = S extends Model.Any ? S["jsonUpdate"]["Type"] : MakeIn<S>
+
 // Matches `Model.Any`, which is structural
-const createSchema = (resource: Schema.Top): Schema.Top =>
+const isModel = (resource: Schema.Top): resource is Schema.Top & Model.Any =>
   Predicate.hasProperty(resource, "insert") && Predicate.hasProperty(resource, "jsonCreate")
-    ? resource.insert as Schema.Top
-    : resource
+
+const createSchema = (resource: Schema.Top): Schema.Top => isModel(resource) ? resource.insert : resource
+
+const updateSchema = (resource: Schema.Top): Schema.Top => isModel(resource) ? resource.update : resource
+
+const fieldsOf = (variant: Schema.Top): Schema.Struct.Fields => (variant as Schema.Struct<Schema.Struct.Fields>).fields
+
+// The fields of the resource that carry over into an update. A `Model` class
+// carries its `update` fields, except the ones that variant generates and a
+// payload can't set, such as `Model.DateTimeUpdate`.
+const carried = (resource: Schema.Top, row: object): object => {
+  if (!isModel(resource)) return { ...row }
+  const fields = fieldsOf(resource.update)
+  const payload = fieldsOf(resource.jsonUpdate)
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(fields)) {
+    if (fields[key].ast.context?.constructorDefault !== undefined && !(key in payload)) continue
+    if (key in row) out[key] = (row as Record<string, unknown>)[key]
+  }
+  return out
+}
 
 // -----------------------------------------------------------------------------
 // Type-level errors
@@ -242,20 +282,21 @@ export interface SetInput<A, Id extends string> {
  *
  * - `filter`: which existing resources the action may touch. Used by
  *   `require`, `can`, `filter`, and on the old value by `update`.
- * - `check`: what a resource must satisfy after `update`. Defaults to
- *   `filter`.
+ * - `check`: what a resource must satisfy after `update`, with the update
+ *   applied. Defaults to `filter`.
  * - `set`: values `update` writes for the caller, which override the patch.
+ *   They are fields of the value {@link UpdateSchema} builds.
  * - `forbid`: when the action is denied regardless of `filter` and `check`.
  *
  * @stability experimental
  * @category models
  * @since 4.1.3
  */
-export interface ActionOptions<A, Id extends string, Resource, Allowed extends string> {
-  readonly filter: (input: ActionInput<A, Id, Resource, Allowed>) => Condition.Input<any>
-  readonly check?: ((input: ActionInput<A, Id, Resource, Allowed>) => Condition.Input<any>) | undefined
-  readonly forbid?: ((input: ActionInput<A, Id, Resource, Allowed>) => Condition.Input<any>) | undefined
-  readonly set?: ((input: SetInput<A, Id>) => Partial<Resource>) | undefined
+export interface ActionOptions<A, Id extends string, S extends Schema.Top, Allowed extends string> {
+  readonly filter: (input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>
+  readonly check?: ((input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>) | undefined
+  readonly forbid?: ((input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>) | undefined
+  readonly set?: ((input: SetInput<A, Id>) => Partial<MakeIn<UpdateSchema<S>>>) | undefined
 }
 
 /**
@@ -355,7 +396,7 @@ export interface Rules<
    * Declares an action on existing resources. Every action needs a `filter`;
    * see {@link ActionOptions}.
    */
-  action<const Ac extends string, const D extends ActionOptions<A, Id, S["Type"], Exclude<Actions, Creates>>>(
+  action<const Ac extends string, const D extends ActionOptions<A, Id, S, Exclude<Actions, Creates>>>(
     name: Ac extends Actions ? AlreadyDeclared<Ac> : Ac,
     options: D
   ): Rules<A, Id, S, Actions | Ac, Creates, R | OptionsServices<D>, AddPresets<Presets, Ac, D>>
@@ -451,6 +492,38 @@ export type PayloadOf<U, Action extends string> = U extends
   : never
 
 /**
+ * The value `Permissions.update` builds for an action on existing resources.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type UpdatedOf<U, Action extends string> = U extends
+  Rules<any, any, infer S extends Schema.Top, infer Actions, any, any, any> ?
+  [Action] extends [Actions] ? UpdateSchema<S>["Type"] : never
+  : never
+
+/**
+ * The patch `Permissions.update` takes for an action: any part of the
+ * {@link UpdatePayload}, and of the fields `set` fills. Those may be given for
+ * principals that get no presets, but `set` overrides them.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type PatchOf<U, Action extends string> = U extends
+  Rules<any, any, infer S extends Schema.Top, infer Actions, any, any, any> ?
+  [Action] extends [Actions] ? Types.Simplify<
+      Partial<
+        & Omit<UpdatePayload<S>, PresetsOf<U, Action>>
+        & Pick<MakeIn<UpdateSchema<S>>, PresetsOf<U, Action> & keyof MakeIn<UpdateSchema<S>>>
+      >
+    >
+  : never
+  : never
+
+/**
  * The services required by custom conditions in a union of rule sets.
  *
  * @stability experimental
@@ -541,7 +614,9 @@ const makeRules = (resource: Schema.Top, actions: ReadonlyMap<string, Action>): 
  * every `create` and `update` with the real principal.
  *
  * Rules on existing resources refer to the resource type. Create rules refer
- * to the value `create` builds: for a `Model` class, its `insert` variant.
+ * to the value `create` builds: for a `Model` class, its `insert` variant. For
+ * a `Model` class, `update` builds the `update` variant, so an action's `set`
+ * fills fields of that variant.
  *
  * Declaring an action name twice is a type error.
  *
@@ -681,14 +756,18 @@ export interface Permissions<I, A, U extends Any> {
     payload: PayloadOf<U, Ac>
   ): Effect.Effect<Authorized<Ac, CreatedOf<U, Ac>>, PermissionError.PermissionError, I | Authorizer.Authorizer>
   /**
-   * Checks the resource as it is, applies the patch and the action's `set`
-   * presets, then checks the resource as it would be.
+   * Checks the resource as it is, builds the value the update writes from the
+   * resource, the patch, and the action's `set` presets, then checks the
+   * resource as it would be. For a `Model` class the result is its `update`
+   * variant, ready for the repository, and fields that variant generates, such
+   * as `Model.DateTimeUpdate`, are generated again. A value the schema rejects
+   * is a defect.
    */
-  update<Ac extends ActionsOf<U>, Resource extends ResourceOf<U, Ac>>(
+  update<Ac extends ActionsOf<U>>(
     action: NotCreate<U, Ac>,
-    resource: Resource,
-    patch: Partial<Omit<ResourceOf<U, Ac>, PresetsOf<U, Ac>>>
-  ): Effect.Effect<Authorized<Ac, Resource>, PermissionError.PermissionError, I | Authorizer.Authorizer>
+    resource: ResourceOf<U, Ac>,
+    patch: PatchOf<U, Ac>
+  ): Effect.Effect<Authorized<Ac, UpdatedOf<U, Ac>>, PermissionError.PermissionError, I | Authorizer.Authorizer>
 }
 
 const merge = (base: object, ...parts: ReadonlyArray<object>): any =>
@@ -759,10 +838,24 @@ export const make = <I, A, Id extends string, const Rs extends ReadonlyArray<Any
   })
 
   const update = Effect.fnUntraced(function*(action: string, resource: object, patch: object) {
+    const entry = actions.get(action)
+    if (entry?.kind !== "action") {
+      return yield* Effect.die(new Error(`Permissions.update: "${action}" is not an action on existing resources`))
+    }
     yield* orDeny(yield* decide("check", action, resource))
-    const value = merge(resource, patch, presets(action, yield* principal))
-    yield* orDeny(yield* decide("checkWrite", action, value))
-    return value
+    const value = yield* Effect.orDie(
+      updateSchema(entry.resource).makeEffect({
+        ...carried(entry.resource, resource),
+        ...patch,
+        ...presets(action, yield* principal)
+      })
+    )
+    // A `Model` class's update variant lacks some of its fields, so the check
+    // sees the resource with the update applied
+    yield* orDeny(
+      yield* decide("checkWrite", action, isModel(entry.resource) ? merge(resource, value as object) : value)
+    )
+    return value as any
   })
 
   const self: Permissions<I, A, Rs[number]> = {
