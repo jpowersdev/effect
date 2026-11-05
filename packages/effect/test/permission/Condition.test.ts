@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Exit } from "effect"
-import { Condition } from "effect/permission"
+import { Deferred, Effect, Exit, Fiber } from "effect"
+import { Condition, Principal } from "effect/permission"
 
 interface Caller {
   readonly id: string
@@ -94,43 +94,113 @@ describe("Condition", () => {
   })
 
   describe("simplify", () => {
-    it("fills in the principal and leaves resource fields", () => {
-      const simplified = Condition.simplify(
-        Condition.and(Condition.not(principal.admin), Condition.eq(resource.ownerId, principal.id)),
-        caller
-      )
-      assert.strictEqual(simplified._tag, "Compare")
-      if (simplified._tag === "Compare") {
-        assert.isTrue(Condition.isRef(simplified.left))
-        assert.strictEqual(simplified.right, "u1")
-      }
-    })
+    it.effect("fills in the principal and leaves resource fields", () =>
+      Effect.gen(function*() {
+        const simplified = yield* Condition.simplify(
+          Condition.and(Condition.not(principal.admin), Condition.eq(resource.ownerId, principal.id)),
+          caller
+        )
+        assert.strictEqual(simplified._tag, "Compare")
+        if (simplified._tag === "Compare") {
+          assert.isTrue(Condition.isRef(simplified.left))
+          assert.strictEqual(simplified.right, "u1")
+        }
+      }))
 
-    it("folds conditions that become known", () => {
-      assert.isTrue(
-        Condition.isAlways(Condition.simplify(Condition.or(principal.admin, resource.published), { admin: true }))
-      )
-      assert.isTrue(
-        Condition.isNever(Condition.simplify(Condition.and(principal.admin, resource.published), { admin: false }))
-      )
-      assert.isTrue(Condition.isNever(Condition.simplify(Condition.or(), caller)))
-      assert.isTrue(Condition.isAlways(Condition.simplify(Condition.and(), caller)))
-    })
+    it.effect("folds conditions that become known", () =>
+      Effect.gen(function*() {
+        assert.isTrue(
+          Condition.isAlways(
+            yield* Condition.simplify(Condition.or(principal.admin, resource.published), { admin: true })
+          )
+        )
+        assert.isTrue(
+          Condition.isNever(
+            yield* Condition.simplify(Condition.and(principal.admin, resource.published), { admin: false })
+          )
+        )
+        assert.isTrue(Condition.isNever(yield* Condition.simplify(Condition.or(), caller)))
+        assert.isTrue(Condition.isAlways(yield* Condition.simplify(Condition.and(), caller)))
+      }))
 
-    it("turns a principal list into a literal list", () => {
-      const simplified = Condition.simplify(Condition.oneOf(resource.id, principal.unitIds), caller)
-      assert.strictEqual(simplified._tag, "OneOf")
-      assert.isTrue(
-        Condition.isNever(Condition.simplify(Condition.oneOf(resource.id, principal.unitIds), { unitIds: [] }))
-      )
-    })
+    it.effect("turns a principal list into a literal list", () =>
+      Effect.gen(function*() {
+        const simplified = yield* Condition.simplify(Condition.oneOf(resource.id, principal.unitIds), caller)
+        assert.strictEqual(simplified._tag, "OneOf")
+        assert.isTrue(
+          Condition.isNever(yield* Condition.simplify(Condition.oneOf(resource.id, principal.unitIds), { unitIds: [] }))
+        )
+      }))
 
-    it("keeps a missing principal value unknown, so negation does not pass", () => {
-      const simplified = Condition.simplify(
-        Condition.not(Condition.eq(resource.hospitalId, principal.hospitalId)),
-        { ...caller, hospitalId: undefined }
-      )
-      assert.isTrue(Condition.isNever(simplified))
-    })
+    it.effect("keeps a missing principal value unknown, so negation does not pass", () =>
+      Effect.gen(function*() {
+        const simplified = yield* Condition.simplify(
+          Condition.not(Condition.eq(resource.hospitalId, principal.hospitalId)),
+          { ...caller, hospitalId: undefined }
+        )
+        assert.isTrue(Condition.isNever(simplified))
+      }))
+  })
+
+  describe("lazy attributes", () => {
+    interface LazyCaller {
+      readonly admin: boolean
+      readonly unitIds: Principal.Lazy<ReadonlyArray<string>>
+    }
+    const lazy = Condition.refs<LazyCaller, Doc>()
+    const condition = Condition.or(lazy.principal.admin, Condition.oneOf(lazy.resource.id, lazy.principal.unitIds))
+
+    const counted = <A, E>(load: Effect.Effect<A, E>) => {
+      const loads = { count: 0 }
+      const attribute = Principal.lazy(Effect.suspend(() => {
+        loads.count++
+        return load
+      }))
+      return { attribute, loads }
+    }
+
+    it.effect("loads an attribute only when a condition reaches it, and only once", () =>
+      Effect.gen(function*() {
+        const { attribute: unitIds, loads } = counted(Effect.succeed(["d1"]))
+        assert.isTrue(yield* Condition.evaluate(condition, { principal: { admin: true, unitIds }, resource: doc }))
+        assert.isTrue(Condition.isAlways(yield* Condition.simplify(condition, { admin: true, unitIds })))
+        assert.strictEqual(loads.count, 0)
+
+        assert.isTrue(yield* Condition.evaluate(condition, { principal: { admin: false, unitIds }, resource: doc }))
+        const simplified = yield* Condition.simplify(condition, { admin: false, unitIds })
+        assert.strictEqual(simplified._tag, "OneOf")
+        assert.deepStrictEqual(yield* unitIds, ["d1"])
+        assert.strictEqual(loads.count, 1)
+      }))
+
+    it.effect("shares one load between readers at the same time", () =>
+      Effect.gen(function*() {
+        const gate = yield* Deferred.make<void>()
+        const { attribute: unitIds, loads } = counted(Effect.as(Deferred.await(gate), ["d1"]))
+        const readers = yield* Effect.forkChild(
+          Effect.all([
+            unitIds,
+            unitIds,
+            Condition.evaluate(condition, { principal: { admin: false, unitIds }, resource: doc })
+          ], {
+            concurrency: "unbounded"
+          })
+        )
+        yield* Effect.yieldNow
+        yield* Deferred.succeed(gate, undefined)
+        assert.deepStrictEqual(yield* Fiber.join(readers), [["d1"], ["d1"], true])
+        assert.strictEqual(loads.count, 1)
+      }))
+
+    it.effect("fails with PermissionUnavailable when an attribute can't load, and keeps the failure", () =>
+      Effect.gen(function*() {
+        const { attribute: unitIds, loads } = counted(Effect.fail("down"))
+        const principal = { admin: false, unitIds }
+        const error = yield* Effect.flip(Condition.evaluate(condition, { principal, resource: doc }))
+        assert.strictEqual(error._tag, "PermissionUnavailable")
+        assert.strictEqual((yield* Effect.flip(Condition.simplify(condition, principal)))._tag, "PermissionUnavailable")
+        assert.strictEqual((yield* Effect.flip(unitIds))._tag, "PermissionUnavailable")
+        assert.strictEqual(loads.count, 1)
+      }))
   })
 })

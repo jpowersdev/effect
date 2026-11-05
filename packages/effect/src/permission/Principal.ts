@@ -11,6 +11,9 @@
  * attribute type is theirs and handlers that check permissions require it. The
  * subject id type can be the application's own too, such as a branded id.
  *
+ * An attribute that costs a lookup can be {@link lazy}: it is loaded the first
+ * time a rule or handler reads it, then kept for the life of the principal.
+ *
  * **Example** (Declaring the application's principal)
  *
  * ```ts
@@ -32,8 +35,15 @@
  * @since 4.1.3
  */
 import type * as Brand from "../Brand.ts"
-import { dual } from "../Function.ts"
+import * as Effect from "../Effect.ts"
+import * as Effectable from "../Effectable.ts"
+import { dual, identity } from "../Function.ts"
+import * as Predicate from "../Predicate.ts"
+import type * as Types from "../Types.ts"
 import type * as Condition from "./Condition.ts"
+import * as PermissionError from "./PermissionError.ts"
+
+const LazyTypeId = "~effect/permission/Principal/Lazy" as const
 
 /**
  * Who a principal is: a user or a service, identified by an id.
@@ -128,6 +138,118 @@ export interface Fields<A, Id extends string = string> {
  * @since 4.1.3
  */
 export type Refs<A, Id extends string = string> = Condition.Refs<Fields<A, Id>>
+
+/**
+ * An attribute that is loaded the first time something reads it, then kept for
+ * the life of the principal.
+ *
+ * **Details**
+ *
+ * A lazy attribute is an effect, so handlers read it with `yield*`. Rules
+ * refer to it like any other attribute, and the authorizer loads it only when
+ * a condition reaches it: for a super admin,
+ * `Condition.or(principal.attributes.isSuperAdmin, ...)` never loads what comes
+ * after.
+ *
+ * Callers that read it at the same time share one load. A load that fails is
+ * logged and fails with `PermissionUnavailable`, and that failure is kept too,
+ * so every check in a request gets the same answer.
+ *
+ * **Gotchas**
+ *
+ * The value is kept as long as the principal is. Build a principal for each
+ * request, as authentication middleware does, so a change to the attribute
+ * shows up on the next request.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.3
+ */
+export interface Lazy<out A> extends Effect.Effect<A, PermissionError.PermissionUnavailable> {
+  readonly [LazyTypeId]: {
+    readonly _A: Types.Covariant<A>
+  }
+}
+
+/**
+ * The value of an attribute: what a {@link Lazy} attribute loads, or the
+ * attribute itself.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+// Matching on the one property is much cheaper than matching `Lazy`, which
+// would compare every member of `Effect`
+export type Loaded<A> = A extends { readonly [LazyTypeId]: { readonly _A: Types.Covariant<infer B> } } ? B : A
+
+class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavailable> {
+  readonly [LazyTypeId] = { _A: identity }
+  readonly load: Effect.Effect<A, PermissionError.PermissionUnavailable>
+  cached: Effect.Effect<A, PermissionError.PermissionUnavailable> | undefined
+  constructor(load: Effect.Effect<A, PermissionError.PermissionUnavailable>) {
+    super()
+    this.load = load
+  }
+  asEffect(): Effect.Effect<A, PermissionError.PermissionUnavailable> {
+    // Two first reads may each make a cached effect, but only the first one
+    // kept is ever run
+    return Effect.suspend(() =>
+      this.cached ?? Effect.flatMap(Effect.cached(this.load), (cached) => (this.cached ??= cached))
+    )
+  }
+  override toJSON() {
+    return { _id: "Principal.Lazy" }
+  }
+}
+
+/**
+ * Creates an attribute that runs `load` the first time something reads it,
+ * then keeps the result.
+ *
+ * **Example** (Loading an attribute only when a rule needs it)
+ *
+ * ```ts
+ * import { Effect } from "effect"
+ * import { Principal } from "effect/permission"
+ *
+ * declare const managedUnitIds: (profileId: string) => Effect.Effect<ReadonlyArray<string>>
+ *
+ * const principal = Principal.make({
+ *   subject: "profile_1",
+ *   attributes: {
+ *     isSuperAdmin: false,
+ *     managedUnitIds: Principal.lazy(managedUnitIds("profile_1"))
+ *   }
+ * })
+ *
+ * const program = Effect.gen(function*() {
+ *   const unitIds = yield* principal.attributes.managedUnitIds
+ *   yield* Effect.log(unitIds)
+ * })
+ * ```
+ *
+ * @stability experimental
+ * @category constructors
+ * @since 4.1.3
+ */
+export const lazy = <A, E>(load: Effect.Effect<A, E>): Lazy<A> =>
+  new LazyImpl(load.pipe(
+    Effect.catch((cause) =>
+      Effect.logWarning("A lazy principal attribute failed to load", cause).pipe(
+        Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
+      )
+    )
+  ))
+
+/**
+ * Returns `true` when a value is a {@link Lazy} attribute.
+ *
+ * @stability experimental
+ * @category guards
+ * @since 4.1.3
+ */
+export const isLazy = (u: unknown): u is Lazy<unknown> => Predicate.hasProperty(u, LazyTypeId)
 
 const toSubject = <Id extends string>(subject: Subject<Id> | Id): Subject<Id> =>
   typeof subject === "string" ? { kind: "user", id: subject } : subject

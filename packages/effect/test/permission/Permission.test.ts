@@ -1,5 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { Context, DateTime, Effect, Layer, Schema } from "effect"
 import { Authorizer, Condition, Permission, Principal } from "effect/permission"
 import { Model } from "effect/schema"
 import { TestClock } from "effect/testing"
@@ -240,6 +240,89 @@ describe("Permission", () => {
           yield* denial(Permissions.update("units:update", u1, { name: "x" }).pipe(as(otherNurse))),
           "PermissionDenied:NoPermission"
         )
+      }))
+  })
+
+  describe("lazy attributes", () => {
+    interface LazyMember {
+      readonly isSuperAdmin: boolean
+      readonly homeHospitalId: Principal.Lazy<string>
+    }
+
+    class LazyPrincipal extends Context.Service<
+      LazyPrincipal,
+      Principal.Principal<LazyMember>
+    >()("test/permission/LazyPrincipal") {}
+
+    const LazyPermissions = Permission.make(LazyPrincipal, {
+      rules: [
+        Permission.rules(LazyPrincipal, Unit).action("units:read", {
+          filter: ({ principal, resource: unit }) =>
+            Condition.or(
+              principal.attributes.isSuperAdmin,
+              Condition.eq(unit.hospitalId, principal.attributes.homeHospitalId)
+            )
+        }).create("units:create", {
+          check: () => Condition.always,
+          // Reading a lazy attribute is an effect, so `set` returns one
+          set: ({ principal }) => Effect.map(principal.attributes.homeHospitalId, (hospitalId) => ({ hospitalId }))
+        })
+      ]
+    })
+
+    const signIn = <E>(isSuperAdmin: boolean, homeHospitalId: Effect.Effect<string, E>) => {
+      const loads = { count: 0 }
+      const principal = Principal.make({
+        subject: "p-1",
+        attributes: {
+          isSuperAdmin,
+          homeHospitalId: Principal.lazy(Effect.suspend(() => {
+            loads.count++
+            return homeHospitalId
+          }))
+        }
+      })
+      const run = <A, E2>(effect: Effect.Effect<A, E2, LazyPrincipal | Authorizer.Authorizer>) =>
+        Effect.provide(Effect.provideService(effect, LazyPrincipal, principal), LazyPermissions.layer)
+      return { principal, loads, run }
+    }
+
+    it.effect("loads an attribute once per principal, and only for rules that reach it", () =>
+      Effect.gen(function*() {
+        const [u1, u2] = units
+        const admin = signIn(true, Effect.succeed("h-9"))
+        yield* admin.run(LazyPermissions.require("units:read", u2))
+        assert.isTrue(Condition.isAlways(yield* admin.run(LazyPermissions.filter("units:read"))))
+        assert.strictEqual(admin.loads.count, 0)
+
+        const nurse = signIn(false, Effect.succeed("h-1"))
+        yield* nurse.run(LazyPermissions.require("units:read", u1))
+        assert.strictEqual(
+          yield* denial(nurse.run(LazyPermissions.require("units:read", u2))),
+          "PermissionDenied:NoPermission"
+        )
+        const filter = yield* nurse.run(LazyPermissions.filter("units:read"))
+        assert.strictEqual(filter._tag === "Compare" && filter.right, "h-1")
+        assert.strictEqual(yield* nurse.principal.attributes.homeHospitalId, "h-1")
+        assert.strictEqual(nurse.loads.count, 1)
+      }))
+
+    it.effect("runs a set that reads a lazy attribute", () =>
+      Effect.gen(function*() {
+        const nurse = signIn(false, Effect.succeed("h-1"))
+        const created = yield* nurse.run(LazyPermissions.create("units:create", { id: "u-9", name: "Wards" }))
+        assert.strictEqual(created.hospitalId, "h-1")
+      }))
+
+    it.effect("fails with PermissionUnavailable when an attribute can't load", () =>
+      Effect.gen(function*() {
+        const nurse = signIn(false, Effect.fail("database down"))
+        assert.strictEqual(
+          yield* denial(nurse.run(LazyPermissions.require("units:read", units[0]))),
+          "PermissionUnavailable"
+        )
+        assert.strictEqual(yield* denial(nurse.run(LazyPermissions.filter("units:read"))), "PermissionUnavailable")
+        assert.strictEqual(nurse.loads.count, 1)
       }))
   })
 

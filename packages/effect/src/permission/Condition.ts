@@ -8,7 +8,10 @@
  * compiled into a SQL `WHERE` clause by `PermissionSql`.
  *
  * Fields are referenced through {@link Refs}, typed views of the principal and
- * the resource whose properties are references rather than values.
+ * the resource whose properties are references rather than values. A
+ * reference to a `Principal.Lazy` attribute is a reference to its value, and
+ * evaluating or simplifying a condition loads the attribute only if it gets
+ * that far.
  *
  * **Details**
  *
@@ -32,6 +35,8 @@ import * as Data from "../Data.ts"
 import * as Effect from "../Effect.ts"
 import * as Predicate from "../Predicate.ts"
 import type * as Types from "../Types.ts"
+import type * as PermissionError from "./PermissionError.ts"
+import * as Principal from "./Principal.ts"
 
 const TypeId = "~effect/permission/Condition" as const
 const RefTypeId = "~effect/permission/Condition/Ref" as const
@@ -87,7 +92,8 @@ type Leaf =
  * **Details**
  *
  * Objects expose one reference per field, recursively. Primitives, arrays,
- * sets, maps, dates, and functions are leaves.
+ * sets, maps, dates, and functions are leaves. A `Principal.Lazy` field is
+ * referenced as the value it loads.
  *
  * @stability experimental
  * @category models
@@ -110,7 +116,7 @@ export type Refs<A> = [NonNullable<A>] extends [Leaf] ? Ref<A>
 export type ObjectRefs<A> = {
   readonly [K in (keyof NonNullable<A> & string) | typeof RefTypeId]: K extends typeof RefTypeId ?
     Ref<A>[typeof RefTypeId]
-    : Refs<NonNullable<A>[K & keyof NonNullable<A>] | Extract<A, null | undefined>>
+    : Refs<Principal.Loaded<NonNullable<A>[K & keyof NonNullable<A>]> | Extract<A, null | undefined>>
 }
 
 /**
@@ -706,13 +712,21 @@ export const hasCustom = (self: Condition<any>): boolean => {
 
 type Truth = boolean | null
 
-const getPath = (root: unknown, path: ReadonlyArray<string>): unknown => {
+// Reads a field, loading any `Principal.Lazy` attribute on the way
+const getPath = (
+  root: unknown,
+  path: ReadonlyArray<string>
+): Effect.Effect<unknown, PermissionError.PermissionUnavailable> => {
   let current = root
-  for (const key of path) {
-    if (current === null || current === undefined) return undefined
-    current = (current as Record<string, unknown>)[key]
+  for (let index = 0; index < path.length; index++) {
+    if (Principal.isLazy(current)) {
+      const rest = path.slice(index)
+      return Effect.flatMap(current, (value) => getPath(value, rest))
+    }
+    if (current === null || current === undefined) return Effect.undefined
+    current = (current as Record<string, unknown>)[path[index]]
   }
-  return current
+  return Principal.isLazy(current) ? current : Effect.succeed(current)
 }
 
 const isMissing = (u: unknown): u is null | undefined => u === null || u === undefined
@@ -795,6 +809,10 @@ export class CustomConditionError extends Data.TaggedError("CustomConditionError
  * conditions, stopping as soon as the result is known. Relation lookups go
  * through `related`; evaluating a relation without it is a defect.
  *
+ * A `Principal.Lazy` attribute is loaded when evaluation reaches it, so one
+ * that comes after the result is known is never loaded. A failed load is a
+ * `PermissionUnavailable` failure.
+ *
  * @stability experimental
  * @category evaluation
  * @since 4.1.3
@@ -808,27 +826,46 @@ export const evaluate = <R, E = never, R2 = never>(
       | ((relation: Relation<any, any>, subject: unknown, object: unknown) => Effect.Effect<boolean, E, R2>)
       | undefined
   }
-): Effect.Effect<boolean, E | CustomConditionError, R | R2> => {
-  const resolve = (operand: Operand<unknown>): unknown => {
-    if (!isRef(operand)) return operand
+): Effect.Effect<boolean, E | CustomConditionError | PermissionError.PermissionUnavailable, R | R2> => {
+  type Failure = E | CustomConditionError | PermissionError.PermissionUnavailable
+  const resolve = (operand: Operand<unknown>): Effect.Effect<unknown, PermissionError.PermissionUnavailable> => {
+    if (!isRef(operand)) return Effect.succeed(operand)
     const { path, source } = refMeta(operand)
     return getPath(source === "principal" ? options.principal : options.resource, path)
   }
-  const go = (condition: Condition<any>): Effect.Effect<Truth, E | CustomConditionError, R | R2> => {
+  // Resolves both operands, skipping the second when the first is missing
+  const both = (
+    first: Operand<unknown>,
+    second: Operand<unknown>,
+    f: (first: unknown, second: unknown) => Effect.Effect<Truth, Failure, R | R2>
+  ): Effect.Effect<Truth, Failure, R | R2> =>
+    Effect.flatMap(
+      resolve(first),
+      (a) => isMissing(a) ? Effect.succeed(null) : Effect.flatMap(resolve(second), (b) => f(a, b))
+    )
+  const go = (condition: Condition<any>): Effect.Effect<Truth, Failure, R | R2> => {
     switch (condition._tag) {
       case "Literal":
         return Effect.succeed(condition.value)
       case "Truthy":
-        return Effect.succeed(truthyValue(resolve(condition.value)))
+        return Effect.map(resolve(condition.value), truthyValue)
       case "Compare":
-        return Effect.succeed(compareValues(condition.operator, resolve(condition.left), resolve(condition.right)))
-      case "OneOf":
-        return Effect.succeed(oneOfValues(
-          resolve(condition.value),
-          isRef(condition.list) ? toList(resolve(condition.list)) : condition.list.map(resolve)
-        ))
+        return both(
+          condition.left,
+          condition.right,
+          (left, right) => Effect.succeed(compareValues(condition.operator, left, right))
+        )
+      case "OneOf": {
+        const { list } = condition
+        return Effect.flatMap(resolve(condition.value), (value) => {
+          if (isMissing(value)) return Effect.succeed(null)
+          return isRef(list)
+            ? Effect.map(resolve(list), (items) => oneOfValues(value, toList(items)))
+            : Effect.map(Effect.forEach(list, resolve), (items) => oneOfValues(value, items))
+        })
+      }
       case "IsNull":
-        return Effect.succeed(isMissing(resolve(condition.value)))
+        return Effect.map(resolve(condition.value), isMissing)
       case "Not":
         return Effect.map(go(condition.condition), (value) => value === null ? null : !value)
       case "And":
@@ -838,7 +875,7 @@ export const evaluate = <R, E = never, R2 = never>(
         return Effect.suspend(() => {
           const results: Array<Truth> = []
           const conditions = byCost(condition.conditions)
-          const loop = (index: number): Effect.Effect<Truth, E | CustomConditionError, R | R2> =>
+          const loop = (index: number): Effect.Effect<Truth, Failure, R | R2> =>
             index === conditions.length ?
               Effect.succeed(combine(results)) :
               Effect.flatMap(go(conditions[index]), (value) => {
@@ -850,13 +887,14 @@ export const evaluate = <R, E = never, R2 = never>(
         })
       }
       case "Related": {
-        const subject = resolve(condition.subject)
-        const object = resolve(condition.object)
-        if (isMissing(subject) || isMissing(object)) return Effect.succeed(null)
-        if (options.related === undefined) {
-          return Effect.die(new Error(`Condition.evaluate: no relation lookup for "${condition.relation.name}"`))
-        }
-        return options.related(condition.relation, subject, object)
+        const { relation } = condition
+        return both(condition.subject, condition.object, (subject, object) => {
+          if (isMissing(object)) return Effect.succeed(null)
+          if (options.related === undefined) {
+            return Effect.die(new Error(`Condition.evaluate: no relation lookup for "${relation.name}"`))
+          }
+          return options.related(relation, subject, object)
+        })
       }
       case "Custom":
         return condition.evaluate({ principal: options.principal, resource: options.resource }).pipe(
@@ -882,78 +920,108 @@ export const evaluate = <R, E = never, R2 = never>(
  * Relation lookups and custom conditions are kept as they are, with the
  * principal's values filled in.
  *
+ * Conditions in an `and` or `or` are simplified in the order they are written,
+ * stopping at the first one that decides the result, so a `Principal.Lazy`
+ * attribute after it is never loaded. A failed load is a
+ * `PermissionUnavailable` failure.
+ *
  * @stability experimental
  * @category evaluation
  * @since 4.1.3
  */
-export const simplify = <R>(self: Condition<R>, principal: unknown): Condition<R> => {
-  const substitute = (operand: Operand<unknown>): Operand<unknown> => {
-    if (!isRef(operand)) return operand
+export const simplify = <R>(
+  self: Condition<R>,
+  principal: unknown
+): Effect.Effect<Condition<R>, PermissionError.PermissionUnavailable> => {
+  type Simplified = Effect.Effect<Condition<any>, PermissionError.PermissionUnavailable>
+  const substitute = (
+    operand: Operand<unknown>
+  ): Effect.Effect<Operand<unknown>, PermissionError.PermissionUnavailable> => {
+    if (!isRef(operand)) return Effect.succeed(operand)
     const { path, source } = refMeta(operand)
-    return source === "principal" ? getPath(principal, path) : operand
+    return source === "principal" ? getPath(principal, path) : Effect.succeed(operand)
   }
-  const go = (condition: Condition<any>): Condition<any> => {
+  const go = (condition: Condition<any>): Simplified => {
     switch (condition._tag) {
       case "Literal":
       case "Custom":
-        return condition
-      case "Truthy": {
-        const value = substitute(condition.value)
-        return isRef(value) ? condition : literal(truthyValue(value))
-      }
-      case "Compare": {
-        const left = substitute(condition.left)
-        const right = substitute(condition.right)
-        if (!isRef(left) && !isRef(right)) return literal(compareValues(condition.operator, left, right))
-        if ((!isRef(left) && isMissing(left)) || (!isRef(right) && isMissing(right))) return unknown
-        return make<Compare>({ _tag: "Compare", operator: condition.operator, left, right })
-      }
-      case "OneOf": {
-        const value = substitute(condition.value)
-        const listOperand = isRef(condition.list) ? substitute(condition.list) : condition.list.map(substitute)
-        const list = isRef(listOperand) ? listOperand : toList(listOperand)
-        if (!isRef(value) && isMissing(value)) return unknown
-        if (list === undefined) return unknown
-        if (isRef(list)) return make<OneOf>({ _tag: "OneOf", value, list })
-        const known = list.filter((item) => !isRef(item))
-        const pending = list.filter(isRef)
-        if (!isRef(value) && pending.length === 0) return literal(oneOfValues(value, known))
-        if (isRef(value) && pending.length === 0 && known.every(isMissing)) return never
-        return make<OneOf>({ _tag: "OneOf", value, list })
-      }
-      case "IsNull": {
-        const value = substitute(condition.value)
-        return isRef(value) ? make<IsNull>({ _tag: "IsNull", value }) : literal(isMissing(value))
-      }
-      case "Not": {
-        const inner = go(condition.condition)
-        return inner._tag === "Literal" ? literal(inner.value === null ? null : !inner.value) : not(inner)
-      }
+        return Effect.succeed(condition)
+      case "Truthy":
+        return Effect.map(
+          substitute(condition.value),
+          (value) => isRef(value) ? condition : literal(truthyValue(value))
+        )
+      case "Compare":
+        return Effect.flatMap(substitute(condition.left), (left) => {
+          if (!isRef(left) && isMissing(left)) return Effect.succeed(unknown)
+          return Effect.map(substitute(condition.right), (right) => {
+            if (!isRef(left) && !isRef(right)) return literal(compareValues(condition.operator, left, right))
+            if (!isRef(right) && isMissing(right)) return unknown
+            return make<Compare>({ _tag: "Compare", operator: condition.operator, left, right })
+          })
+        })
+      case "OneOf":
+        return Effect.flatMap(substitute(condition.value), (value) => {
+          if (!isRef(value) && isMissing(value)) return Effect.succeed(unknown)
+          const listOperand = isRef(condition.list)
+            ? substitute(condition.list)
+            : Effect.forEach(condition.list, substitute)
+          return Effect.map(listOperand, (listOperand) => {
+            const list = isRef(listOperand) ? listOperand : toList(listOperand)
+            if (list === undefined) return unknown
+            if (isRef(list)) return make<OneOf>({ _tag: "OneOf", value, list })
+            const known = list.filter((item) => !isRef(item))
+            const pending = list.filter(isRef)
+            if (!isRef(value) && pending.length === 0) return literal(oneOfValues(value, known))
+            if (isRef(value) && pending.length === 0 && known.every(isMissing)) return never
+            return make<OneOf>({ _tag: "OneOf", value, list })
+          })
+        })
+      case "IsNull":
+        return Effect.map(
+          substitute(condition.value),
+          (value) => isRef(value) ? make<IsNull>({ _tag: "IsNull", value }) : literal(isMissing(value))
+        )
+      case "Not":
+        return Effect.map(
+          go(condition.condition),
+          (inner) => inner._tag === "Literal" ? literal(inner.value === null ? null : !inner.value) : not(inner)
+        )
       case "And":
       case "Or": {
         const isAnd = condition._tag === "And"
-        const parts: Array<Condition<any>> = []
-        for (const child of condition.conditions) {
-          const simplified = go(child)
-          if (simplified._tag === condition._tag) {
-            parts.push(...simplified.conditions)
-          } else {
-            parts.push(simplified)
+        const decided = isAnd ? never : always
+        return Effect.suspend(() => {
+          const parts: Array<Condition<any>> = []
+          const loop = (index: number): Simplified => {
+            if (index === condition.conditions.length) {
+              const rest = parts.filter((part) => !(part._tag === "Literal" && part.value === isAnd))
+              if (rest.length === 0) return Effect.succeed(isAnd ? always : never)
+              if (rest.length === 1) return Effect.succeed(rest[0])
+              return Effect.succeed(isAnd ? and(...rest) : or(...rest))
+            }
+            return Effect.flatMap(go(condition.conditions[index]), (simplified) => {
+              if (simplified._tag === "Literal" && simplified.value === !isAnd) return Effect.succeed(decided)
+              if (simplified._tag === condition._tag) {
+                parts.push(...simplified.conditions)
+              } else {
+                parts.push(simplified)
+              }
+              return loop(index + 1)
+            })
           }
-        }
-        if (parts.some((part) => part._tag === "Literal" && part.value === !isAnd)) return isAnd ? never : always
-        const rest = parts.filter((part) => !(part._tag === "Literal" && part.value === isAnd))
-        if (rest.length === 0) return isAnd ? always : never
-        if (rest.length === 1) return rest[0]
-        return isAnd ? and(...rest) : or(...rest)
+          return loop(0)
+        })
       }
       case "Related":
-        return make<Related>({
-          _tag: "Related",
-          relation: condition.relation,
-          subject: substitute(condition.subject),
-          object: substitute(condition.object)
-        })
+        return Effect.flatMap(
+          substitute(condition.subject),
+          (subject) =>
+            Effect.map(
+              substitute(condition.object),
+              (object) => make<Related>({ _tag: "Related", relation: condition.relation, subject, object })
+            )
+        )
     }
   }
   return go(self)
