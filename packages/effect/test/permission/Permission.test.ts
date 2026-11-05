@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Authorizer, Condition, Permission, Principal } from "effect/permission"
 import { Model } from "effect/schema"
+import { TestClock } from "effect/testing"
 import {
   admin,
   CurrentPrincipal,
@@ -24,11 +25,14 @@ const as =
   <A, E>(effect: Effect.Effect<A, E, CurrentPrincipal | Authorizer.Authorizer>): Effect.Effect<A, E> =>
     Effect.provide(Effect.provideService(effect, CurrentPrincipal, principal), TestLayer)
 
+const ShiftId = Schema.String.pipe(Schema.brand("ShiftId"))
+
 class Shift extends Model.Class<Shift>("Shift")({
-  id: Model.UuidV4Insert(Schema.String.pipe(Schema.brand("ShiftId"))),
+  id: Model.UuidV4Insert(ShiftId),
   unitId: Schema.String,
   ownerId: Model.GeneratedByApp(Schema.String),
-  createdAt: Model.DateTimeInsert
+  createdAt: Model.DateTimeInsert,
+  updatedAt: Model.DateTimeUpdate
 }) {}
 
 const ShiftPermissions = Permission.make(CurrentPrincipal, {
@@ -36,6 +40,15 @@ const ShiftPermissions = Permission.make(CurrentPrincipal, {
     Permission.rules(CurrentPrincipal, Shift).create("shifts:create", {
       set: ({ principal }) => ({ ownerId: principal.subject.id }),
       check: ({ principal, resource: shift }) => Condition.related(UnitMembership, principal.subject.id, shift.unitId)
+    }).action("shifts:update", {
+      filter: ({ principal, resource: shift }) => Condition.eq(shift.ownerId, principal.subject.id),
+      // createdAt isn't in the update variant, so this passes only if the
+      // check sees the whole shift
+      check: ({ principal, resource: shift }) =>
+        Condition.and(
+          Condition.isNotNull(shift.createdAt),
+          Condition.related(UnitMembership, principal.subject.id, shift.unitId)
+        )
     })
   ]
 })
@@ -185,6 +198,28 @@ describe("Permission", () => {
   })
 
   describe("update", () => {
+    it.effect("builds a Model's update variant from the row, generating its update fields again", () =>
+      Effect.gen(function*() {
+        const epoch = DateTime.makeUnsafe(0)
+        const shift = new Shift({
+          id: ShiftId.make("sh-1"),
+          unitId: "u-2",
+          ownerId: "p-nurse",
+          createdAt: epoch,
+          updatedAt: epoch
+        })
+        yield* TestClock.adjust("1 hour")
+        const updated = yield* ShiftPermissions.update("shifts:update", shift, {}).pipe(asShifts(nurse))
+        assert.deepStrictEqual(Object.keys(updated).sort(), ["id", "ownerId", "unitId", "updatedAt"])
+        assert.strictEqual(updated.id, "sh-1")
+        assert.strictEqual(updated.ownerId, "p-nurse")
+        assert.isTrue(DateTime.isGreaterThan(updated.updatedAt, epoch))
+        assert.strictEqual(
+          yield* denial(ShiftPermissions.update("shifts:update", shift, { unitId: "u-1" }).pipe(asShifts(nurse))),
+          "PermissionDenied:NoPermission"
+        )
+      }))
+
     it.effect("checks the resource before and after the change", () =>
       Effect.gen(function*() {
         const [u1] = units

@@ -11,7 +11,8 @@ class Post extends Model.Class<Post>("Post")({
   authorId: Model.GeneratedByApp(ProfileId),
   status: Model.GeneratedByApp(Schema.Literals(["draft", "live"])),
   title: Schema.String,
-  createdAt: Model.DateTimeInsert
+  createdAt: Model.DateTimeInsert,
+  updatedAt: Model.DateTimeUpdate
 }) {}
 
 class Note extends Schema.Class<Note>("Note")({
@@ -44,13 +45,21 @@ const PostRules = Permission.rules(CurrentPrincipal, Post)
     check: ({ principal }) => principal.attributes.editor,
     set: ({ principal }) => ({ authorId: principal.subject.id, status: "draft" })
   })
+  .action("posts:approve", {
+    filter: ({ principal }) => principal.attributes.editor,
+    set: () => ({ status: "live" })
+  })
 
 const NoteRules = Permission.rules(CurrentPrincipal, Note)
   .create("notes:create", { check: () => Condition.always })
+  .action("notes:edit", {
+    filter: ({ principal, resource: note }) => Condition.eq(note.authorId, principal.subject.id)
+  })
 
 const Permissions = Permission.make(CurrentPrincipal, { rules: [PostRules, NoteRules] })
 
 declare const post: Post
+declare const note: Note
 declare const payload: typeof Post.jsonCreate.Type
 
 describe("Principal", () => {
@@ -81,6 +90,18 @@ describe("rules", () => {
     NoteRules.create("notes:import", { check: () => Condition.always })
   })
 
+  it("types an action's set against the value update builds", () => {
+    PostRules.action("posts:reassign", {
+      filter: () => Condition.always,
+      set: ({ principal }) => ({ authorId: principal.subject.id })
+    })
+    PostRules.action("posts:hide", {
+      filter: () => Condition.always,
+      // @ts-expect-error Type '"hidden"' is not assignable to type '"draft" | "live"'
+      set: () => ({ status: "hidden" })
+    })
+  })
+
   it("types create rules against the value create builds", () => {
     PostRules.create("posts:publish", {
       // @ts-expect-error Property 'id' does not exist on type 'ObjectRefs<{ readonly authorId: string & Brand<"ProfileId">;
@@ -91,7 +112,7 @@ describe("rules", () => {
 
   it("only lets allowed refer to actions on existing resources declared before", () => {
     PostRules.action("posts:delete", {
-      // @ts-expect-error Argument of type '"posts:create"' is not assignable to parameter of type '"posts:read" | "posts:update"'
+      // @ts-expect-error Argument of type '"posts:create"' is not assignable to parameter of type '"posts:read" | "posts:update" | "posts:approve"'
       filter: ({ allowed }) => allowed("posts:create")
     })
     Permission.rules(CurrentPrincipal, Post).action("posts:update", {
@@ -171,5 +192,38 @@ describe("Permissions", () => {
       >
     >()
     expect(Permissions.filter).type.toBeCallableWith("posts:create")
+  })
+
+  it("updates a Model's update variant from part of its jsonUpdate payload", () => {
+    expect(Permissions.update("posts:update", post, { title: "Renamed" })).type.toBe<
+      Effect.Effect<
+        Permission.Authorized<"posts:update", typeof Post.update.Type>,
+        PermissionError.PermissionError,
+        CurrentPrincipal | Authorizer.Authorizer
+      >
+    >()
+    // `GeneratedByApp` and `GeneratedByDb` fields aren't in the payload
+    // @ts-expect-error Object literal may only specify known properties, and 'authorId' does not exist
+    Permissions.update("posts:update", post, { authorId: post.authorId })
+    // @ts-expect-error Object literal may only specify known properties, and 'id' does not exist
+    Permissions.update("posts:update", post, { id: 2 })
+    // @ts-expect-error Argument of type 'string' is not assignable to parameter of type 'IsACreateAction<"posts:create">'
+    Permissions.update("posts:create", post, {})
+  })
+
+  it("lets update take the fields set fills, for principals that get no presets", () => {
+    expect(Permissions.update).type.toBeCallableWith("posts:approve", post, { status: "live" })
+    // @ts-expect-error Object literal may only specify known properties, and 'status' does not exist
+    Permissions.update("posts:update", post, { status: "live" })
+  })
+
+  it("updates any other resource from part of its constructor input", () => {
+    expect(Permissions.update("notes:edit", note, { body: "" })).type.toBe<
+      Effect.Effect<
+        Permission.Authorized<"notes:edit", Note>,
+        PermissionError.PermissionError,
+        CurrentPrincipal | Authorizer.Authorizer
+      >
+    >()
   })
 })
