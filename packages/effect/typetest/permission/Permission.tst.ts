@@ -30,6 +30,16 @@ class CurrentPrincipal extends Context.Service<
   Principal.Principal<Member, ProfileId>
 >()("test/CurrentPrincipal") {}
 
+interface LazyMember {
+  readonly editor: boolean
+  readonly teamIds: Principal.Lazy<ReadonlyArray<string>>
+}
+
+class LazyPrincipal extends Context.Service<
+  LazyPrincipal,
+  Principal.Principal<LazyMember, ProfileId>
+>()("test/LazyPrincipal") {}
+
 class UntypedPrincipal extends Context.Service<
   UntypedPrincipal,
   Principal.Principal<Member>
@@ -68,6 +78,41 @@ describe("Principal", () => {
     expect(Principal.make({ subject: ProfileId.make("p-1"), attributes: {} })).type.toBe<
       Principal.Authenticated<{}, ProfileId>
     >()
+  })
+})
+
+describe("lazy attributes", () => {
+  it("are effects of the value they load", () => {
+    expect(Principal.lazy(Effect.succeed(1))).type.toBe<Principal.Lazy<number>>()
+    expect(Effect.gen(function*() {
+      return yield* Principal.lazy(Effect.fail("down").pipe(Effect.as(1)))
+    })).type.toBe<Effect.Effect<number, PermissionError.PermissionUnavailable>>()
+  })
+
+  it("are referred to in rules as the value they load", () => {
+    Permission.rules(LazyPrincipal, Note).action("notes:team", {
+      filter: ({ principal, resource: note }) => Condition.oneOf(note.authorId, principal.attributes.teamIds)
+    })
+    Permission.rules(LazyPrincipal, Note).action("notes:mine", {
+      // @ts-expect-error Argument of type 'Ref<readonly string[]>' is not assignable to parameter of type 'Operand<string>'
+      filter: ({ principal, resource: note }) => Condition.eq(note.authorId, principal.attributes.teamIds)
+    })
+  })
+
+  it("are read in set with an effect", () => {
+    const Rules = Permission.rules(LazyPrincipal, Note).create("notes:create", {
+      check: () => Condition.always,
+      set: ({ principal }) => Effect.map(principal.attributes.teamIds, (teamIds) => ({ body: teamIds.join() }))
+    })
+    expect<Permission.PayloadOf<typeof Rules, "notes:create">>().type.toBe<
+      | { readonly id: string; readonly authorId: string; readonly body?: never }
+      | { readonly id: string; readonly authorId: string; readonly body: string }
+    >()
+    Permission.rules(LazyPrincipal, Note).create("notes:create", {
+      check: () => Condition.always,
+      // @ts-expect-error Type 'Lazy<readonly string[]>' is not assignable to type 'string'
+      set: ({ principal }) => ({ body: principal.attributes.teamIds })
+    })
   })
 })
 

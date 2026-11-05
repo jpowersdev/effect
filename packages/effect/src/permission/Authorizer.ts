@@ -326,8 +326,8 @@ export const make = <I, A, U extends Permission.Any>(
     const plan = (request: {
       readonly principal: Principal.Principal<unknown>
       readonly action: string
-    }): Effect.Effect<Decision> =>
-      Effect.sync(() => {
+    }): Effect.Effect<Decision, PermissionError.PermissionUnavailable> =>
+      Effect.gen(function*() {
         const entry = precheck(request.principal, request.action)
         if ("_tag" in entry) {
           return entry
@@ -338,7 +338,7 @@ export const make = <I, A, U extends Permission.Any>(
         if (condition === undefined) {
           return deny(request.action, "NoPermission")
         }
-        const residual = Condition.simplify(
+        const residual = yield* Condition.simplify(
           entry.forbid === undefined ? condition : Condition.and(condition, Condition.not(entry.forbid)),
           request.principal
         )
@@ -346,7 +346,7 @@ export const make = <I, A, U extends Permission.Any>(
           return allow(request.action, residual)
         }
         const forbidden = entry.forbid !== undefined &&
-          Condition.isAlways(Condition.simplify(entry.forbid, request.principal))
+          Condition.isAlways(yield* Condition.simplify(entry.forbid, request.principal))
         return deny(request.action, forbidden ? "Forbidden" : "NoPermission")
       })
 

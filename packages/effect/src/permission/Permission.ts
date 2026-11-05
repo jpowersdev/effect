@@ -265,6 +265,16 @@ export interface ActionInput<A, Id extends string, Resource, Allowed extends str
 }
 
 /**
+ * What `set` returns: the values, or an effect that computes them, for a `set`
+ * that reads a `Principal.Lazy` attribute.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.3
+ */
+export type Presets<A> = A | Effect.Effect<A, PermissionError.PermissionUnavailable>
+
+/**
  * What `set` receives: the real principal, not references.
  *
  * @stability experimental
@@ -286,7 +296,8 @@ export interface SetInput<A, Id extends string> {
  *   applied. Defaults to `filter`.
  * - `set`: values `update` writes for a signed-in principal, which override
  *   the patch. They are fields of the value {@link UpdateSchema} builds. The
- *   system principal gets no `set`, so it passes them in the patch.
+ *   system principal gets no `set`, so it passes them in the patch. A `set`
+ *   that reads a `Principal.Lazy` attribute returns an effect.
  * - `forbid`: when the action is denied regardless of `filter` and `check`.
  *
  * @stability experimental
@@ -297,7 +308,7 @@ export interface ActionOptions<A, Id extends string, S extends Schema.Top, Allow
   readonly filter: (input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>
   readonly check?: ((input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>) | undefined
   readonly forbid?: ((input: ActionInput<A, Id, S["Type"], Allowed>) => Condition.Input<any>) | undefined
-  readonly set?: ((input: SetInput<A, Id>) => Partial<MakeIn<UpdateSchema<S>>>) | undefined
+  readonly set?: ((input: SetInput<A, Id>) => Presets<Partial<MakeIn<UpdateSchema<S>>>>) | undefined
 }
 
 /**
@@ -310,7 +321,8 @@ export interface ActionOptions<A, Id extends string, S extends Schema.Top, Allow
  *   not available.
  * - `set`: values written for a signed-in principal, which override the
  *   payload. It must fill the {@link RequiredPresets}. The system principal
- *   gets no `set`, so it passes them in the payload.
+ *   gets no `set`, so it passes them in the payload. A `set` that reads a
+ *   `Principal.Lazy` attribute returns an effect.
  * - `forbid`: when the action is denied regardless of `check`.
  *
  * @stability experimental
@@ -323,10 +335,10 @@ export type CreateOptions<A, Id extends string, S extends Schema.Top> =
     readonly forbid?: ((input: Input<A, Id, CreateSchema<S>["Type"]>) => Condition.Input<any>) | undefined
   }
   & ([keyof RequiredPresets<S>] extends [never] ? {
-      readonly set?: ((input: SetInput<A, Id>) => Partial<MakeIn<CreateSchema<S>>>) | undefined
+      readonly set?: ((input: SetInput<A, Id>) => Presets<Partial<MakeIn<CreateSchema<S>>>>) | undefined
     }
     : {
-      readonly set: (input: SetInput<A, Id>) => RequiredPresets<S> & Partial<MakeIn<CreateSchema<S>>>
+      readonly set: (input: SetInput<A, Id>) => Presets<RequiredPresets<S> & Partial<MakeIn<CreateSchema<S>>>>
     })
 
 /**
@@ -344,7 +356,7 @@ export interface Action {
   readonly filter: Condition.Condition<any> | undefined
   readonly check: Condition.Condition<any> | undefined
   readonly forbid: Condition.Condition<any> | undefined
-  readonly set: ((input: SetInput<any, any>) => object) | undefined
+  readonly set: ((input: SetInput<any, any>) => Presets<object>) | undefined
 }
 
 type ConditionOf<F> = F extends (...args: ReadonlyArray<any>) => infer C ? C : never
@@ -363,7 +375,8 @@ type OptionsServices<D> = IgnoreAny<
 type IgnoreAny<R> = 0 extends 1 & R ? never : R
 
 type OptionsPresets<D> = D extends { readonly set?: infer F } ?
-  F extends (...args: ReadonlyArray<any>) => infer O ? keyof O : never
+  F extends (...args: ReadonlyArray<any>) => infer O ? keyof (O extends Effect.Effect<infer P, any, any> ? P : O)
+  : never
   : never
 
 type AddPresets<Presets, Ac extends string, D> = [OptionsPresets<D>] extends [never] ? Presets
@@ -618,7 +631,7 @@ type AnyOptions = {
   readonly filter?: ((input: any) => Condition.Input<any>) | undefined
   readonly check?: ((input: any) => Condition.Input<any>) | undefined
   readonly forbid?: ((input: any) => Condition.Input<any>) | undefined
-  readonly set?: ((input: SetInput<any, any>) => object) | undefined
+  readonly set?: ((input: SetInput<any, any>) => Presets<object>) | undefined
 }
 
 const declare = (self: Any, name: string, kind: Action["kind"], options: AnyOptions): Any => {
@@ -903,10 +916,16 @@ export const make = <I, A, Id extends string, const Rs extends ReadonlyArray<Any
   const orDeny = (decision: Authorizer.Decision) =>
     decision._tag === "Deny" ? Effect.fail(Authorizer.toError(decision)) : Effect.void
 
-  const presets = (name: string, current: Principal.Principal<A, Id>): object => {
+  const presets = (
+    name: string,
+    current: Principal.Principal<A, Id>
+  ): Effect.Effect<object, PermissionError.PermissionUnavailable> => {
     const set = actions.get(name)?.set
-    if (set === undefined || current._tag !== "Authenticated") return {}
-    return set({ principal: current })
+    if (set === undefined || current._tag !== "Authenticated") return Effect.succeed({})
+    const values = set({ principal: current })
+    return Effect.isEffect(values)
+      ? values as Effect.Effect<object, PermissionError.PermissionUnavailable>
+      : Effect.succeed(values)
   }
 
   const create = Effect.fnUntraced(function*(action: string, payload: object) {
@@ -922,7 +941,7 @@ export const make = <I, A, Id extends string, const Rs extends ReadonlyArray<Any
       yield* orDeny(yield* authorizer.plan({ principal: current, action }))
     }
     const value = yield* Effect.orDie(
-      createSchema(entry.resource).makeEffect({ ...payload, ...presets(action, current) })
+      createSchema(entry.resource).makeEffect({ ...payload, ...(yield* presets(action, current)) })
     )
     yield* orDeny(yield* decide("checkWrite", action, value))
     return value as any
@@ -938,7 +957,7 @@ export const make = <I, A, Id extends string, const Rs extends ReadonlyArray<Any
       updateSchema(entry.resource).makeEffect({
         ...carried(entry.resource, resource),
         ...patch,
-        ...presets(action, yield* principal)
+        ...(yield* presets(action, yield* principal))
       })
     )
     // A `Model` class's update variant lacks some of its fields, so the check

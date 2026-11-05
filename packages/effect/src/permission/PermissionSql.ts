@@ -163,7 +163,8 @@ const compile = (
       case "Literal":
         return sequence(node.value === true ? "1=1" : node.value === false ? "1=0" : "NULL")
       case "Truthy":
-        return Condition.isRef(node.value) ? column(node.value) : go(Condition.simplify(node, undefined))
+        if (Condition.isRef(node.value)) return column(node.value)
+        return sequence(node.value === true ? "1=1" : node.value === null || node.value === undefined ? "NULL" : "1=0")
       case "Compare":
         return sequence(operand(node.left), operators[node.operator], operand(node.right))
       case "OneOf": {
