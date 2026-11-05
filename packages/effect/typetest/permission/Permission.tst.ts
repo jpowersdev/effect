@@ -211,7 +211,31 @@ describe("Permissions", () => {
     Permissions.update("posts:create", post, {})
   })
 
-  it("lets update take the fields set fills, for principals that get no presets", () => {
+  it("takes one payload shape for signed-in principals and another for the system", () => {
+    expect<Permission.PayloadOf<typeof PostRules, "posts:create">>().type.toBe<
+      // Signed in: `set` fills authorId and status
+      | { readonly title: string; readonly authorId?: never; readonly status?: never }
+      // The system principal gets no `set`, so it passes them
+      | { readonly title: string; readonly authorId: ProfileId; readonly status: "draft" | "live" }
+    >()
+    expect(Permissions.create).type.toBeCallableWith("posts:create", {
+      ...payload,
+      authorId: post.authorId,
+      status: "live"
+    })
+    // @ts-expect-error Property 'authorId' is missing in type '{ status: "live"; title: string; }'
+    Permissions.create("posts:create", { ...payload, status: "live" })
+    // An action without `set` has one shape
+    expect<Permission.PayloadOf<typeof NoteRules, "notes:create">>().type.toBe<
+      { readonly id: string; readonly authorId: string; readonly body: string }
+    >()
+  })
+
+  it("takes one patch shape for signed-in principals and another for the system", () => {
+    expect<Permission.PatchOf<typeof PostRules, "posts:approve">>().type.toBe<
+      | { readonly title?: string; readonly status?: never }
+      | { readonly title?: string; readonly status?: "draft" | "live" }
+    >()
     expect(Permissions.update).type.toBeCallableWith("posts:approve", post, { status: "live" })
     // @ts-expect-error Object literal may only specify known properties, and 'status' does not exist
     Permissions.update("posts:update", post, { status: "live" })
