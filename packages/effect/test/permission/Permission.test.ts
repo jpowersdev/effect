@@ -156,11 +156,13 @@ describe("Permission", () => {
   describe("create", () => {
     it.effect("applies presets over the payload, then checks the result", () =>
       Effect.gen(function*() {
+        // The system principal's shape, from a signed-in principal: `set` replaces the fields
         const created = yield* Permissions.create("swaps:create", {
           id: "s-9",
           unitId: "u-2",
           recipientId: "p-other",
-          requesterId: "someone-else"
+          requesterId: "someone-else",
+          status: "approved"
         }).pipe(as(nurse))
         assert.strictEqual(created.requesterId, "p-nurse")
         assert.strictEqual(created.status, "pending")

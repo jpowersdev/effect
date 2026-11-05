@@ -284,8 +284,9 @@ export interface SetInput<A, Id extends string> {
  *   `require`, `can`, `filter`, and on the old value by `update`.
  * - `check`: what a resource must satisfy after `update`, with the update
  *   applied. Defaults to `filter`.
- * - `set`: values `update` writes for the caller, which override the patch.
- *   They are fields of the value {@link UpdateSchema} builds.
+ * - `set`: values `update` writes for a signed-in principal, which override
+ *   the patch. They are fields of the value {@link UpdateSchema} builds. The
+ *   system principal gets no `set`, so it passes them in the patch.
  * - `forbid`: when the action is denied regardless of `filter` and `check`.
  *
  * @stability experimental
@@ -307,8 +308,9 @@ export interface ActionOptions<A, Id extends string, S extends Schema.Top, Allow
  * - `check`: what the new resource must satisfy. It refers to the value
  *   {@link CreateSchema} builds, so a `Model` field the database generates is
  *   not available.
- * - `set`: values written for the caller, which override the payload. It must
- *   fill the {@link RequiredPresets}.
+ * - `set`: values written for a signed-in principal, which override the
+ *   payload. It must fill the {@link RequiredPresets}. The system principal
+ *   gets no `set`, so it passes them in the payload.
  * - `forbid`: when the action is denied regardless of `check`.
  *
  * @stability experimental
@@ -474,19 +476,58 @@ export type CreatedOf<U, Action extends string> = U extends
   : never
 
 /**
- * The payload `Permissions.create` takes for a create action: the
- * {@link CreatePayload} without the fields `set` fills. Those fields may still
- * be given, for principals that get no presets, but `set` overrides them.
+ * The payload `Permissions.create` takes for a create action. If the action
+ * has a `set`, this is one of two shapes, one per kind of principal:
+ * {@link AuthenticatedPayloadOf} for a signed-in principal, whose `set` fills
+ * its fields, and {@link SystemPayloadOf} for the system principal, which gets
+ * no `set`.
+ *
+ * **Details**
+ *
+ * Which principal runs the call is only known at runtime, so both shapes are
+ * accepted. If a signed-in principal's payload has the fields `set` fills,
+ * `set` replaces them.
  *
  * @stability experimental
  * @category utility types
  * @since 4.1.3
  */
-export type PayloadOf<U, Action extends string> = U extends
+export type PayloadOf<U, Action extends string> = [PresetsOf<U, Action>] extends [never] ?
+  AuthenticatedPayloadOf<U, Action>
+  : AuthenticatedPayloadOf<U, Action> | SystemPayloadOf<U, Action>
+
+/**
+ * The payload of a create action for a signed-in principal: the
+ * {@link CreatePayload}, without the fields the action's `set` fills.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type AuthenticatedPayloadOf<U, Action extends string> = U extends
   Rules<any, any, infer S extends Schema.Top, any, infer Creates, any, any> ?
   [Action] extends [Creates] ? Types.Simplify<
       & Omit<CreatePayload<S>, PresetsOf<U, Action>>
-      & Partial<Pick<MakeIn<CreateSchema<S>>, PresetsOf<U, Action> & keyof MakeIn<CreateSchema<S>>>>
+      & { readonly [K in PresetsOf<U, Action>]?: never }
+    >
+  : never
+  : never
+
+/**
+ * The payload of a create action for the system principal: the
+ * {@link CreatePayload}, with the fields the action's `set` would fill. The
+ * system principal gets no `set`, because there's no signed-in user for it to
+ * read.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type SystemPayloadOf<U, Action extends string> = U extends
+  Rules<any, any, infer S extends Schema.Top, any, infer Creates, any, any> ?
+  [Action] extends [Creates] ? Types.Simplify<
+      & Omit<CreatePayload<S>, PresetsOf<U, Action>>
+      & Pick<MakeIn<CreateSchema<S>>, PresetsOf<U, Action> & keyof MakeIn<CreateSchema<S>>>
     >
   : never
   : never
@@ -504,15 +545,53 @@ export type UpdatedOf<U, Action extends string> = U extends
   : never
 
 /**
- * The patch `Permissions.update` takes for an action: any part of the
- * {@link UpdatePayload}, and of the fields `set` fills. Those may be given for
- * principals that get no presets, but `set` overrides them.
+ * The patch `Permissions.update` takes for an action. If the action has a
+ * `set`, this is one of two shapes, one per kind of principal:
+ * {@link AuthenticatedPatchOf} for a signed-in principal, whose `set` fills its
+ * fields, and {@link SystemPatchOf} for the system principal, which gets no
+ * `set`.
+ *
+ * **Details**
+ *
+ * Which principal runs the call is only known at runtime, so both shapes are
+ * accepted. If a signed-in principal's patch has the fields `set` fills, `set`
+ * replaces them.
  *
  * @stability experimental
  * @category utility types
  * @since 4.1.3
  */
-export type PatchOf<U, Action extends string> = U extends
+export type PatchOf<U, Action extends string> = [PresetsOf<U, Action>] extends [never] ? AuthenticatedPatchOf<U, Action>
+  : AuthenticatedPatchOf<U, Action> | SystemPatchOf<U, Action>
+
+/**
+ * The patch of an action for a signed-in principal: any part of the
+ * {@link UpdatePayload}, without the fields the action's `set` fills.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type AuthenticatedPatchOf<U, Action extends string> = U extends
+  Rules<any, any, infer S extends Schema.Top, infer Actions, any, any, any> ?
+  [Action] extends [Actions] ? Types.Simplify<
+      & Partial<Omit<UpdatePayload<S>, PresetsOf<U, Action>>>
+      & { readonly [K in PresetsOf<U, Action>]?: never }
+    >
+  : never
+  : never
+
+/**
+ * The patch of an action for the system principal: any part of the
+ * {@link UpdatePayload}, and of the fields the action's `set` would fill. The
+ * system principal gets no `set`, because there's no signed-in user for it to
+ * read.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type SystemPatchOf<U, Action extends string> = U extends
   Rules<any, any, infer S extends Schema.Top, infer Actions, any, any, any> ?
   [Action] extends [Actions] ? Types.Simplify<
       Partial<
@@ -750,6 +829,12 @@ export interface Permissions<I, A, U extends Any> {
    * action's `set` presets, then checks it. For a `Model` class the result is
    * its `insert` variant, ready for the repository. A value the schema rejects
    * is a defect.
+   *
+   * **Details**
+   *
+   * A signed-in principal's payload leaves out the fields `set` fills. The
+   * system principal gets no `set`, so its payload includes them. See
+   * {@link PayloadOf}.
    */
   create<Ac extends ActionsOf<U>>(
     action: OnlyCreate<U, Ac>,
@@ -762,6 +847,12 @@ export interface Permissions<I, A, U extends Any> {
    * variant, ready for the repository, and fields that variant generates, such
    * as `Model.DateTimeUpdate`, are generated again. A value the schema rejects
    * is a defect.
+   *
+   * **Details**
+   *
+   * A signed-in principal's patch leaves out the fields `set` fills. The system
+   * principal gets no `set`, so its patch may include them. See
+   * {@link PatchOf}.
    */
   update<Ac extends ActionsOf<U>>(
     action: NotCreate<U, Ac>,
@@ -878,8 +969,8 @@ export const make = <I, A, Id extends string, const Rs extends ReadonlyArray<Any
       const decision = yield* authorizer.plan({ principal: yield* principal, action })
       return decision._tag === "Allow" ? decision.condition : Condition.never
     }),
-    create: (action, payload) => create(action as string, payload),
-    update: (action, resource, patch) => update(action as string, resource, patch)
+    create: (action, payload) => create(action as string, payload as object),
+    update: (action, resource, patch) => update(action as string, resource, patch as object)
   }
   return self
 }
