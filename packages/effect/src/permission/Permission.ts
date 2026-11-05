@@ -306,11 +306,18 @@ export interface Action {
 
 type ConditionOf<F> = F extends (...args: ReadonlyArray<any>) => infer C ? C : never
 
-type OptionsServices<D> = Condition.Services<
-  | ConditionOf<D extends { readonly filter?: infer F } ? F : never>
-  | ConditionOf<D extends { readonly check?: infer F } ? F : never>
-  | ConditionOf<D extends { readonly forbid?: infer F } ? F : never>
+// A rule that doesn't type-check falls back to its options constraint, whose
+// conditions require `any`; dropping it keeps the error at the rule instead of
+// in every layer built from these rules
+type OptionsServices<D> = IgnoreAny<
+  Condition.Services<
+    | ConditionOf<D extends { readonly filter?: infer F } ? F : never>
+    | ConditionOf<D extends { readonly check?: infer F } ? F : never>
+    | ConditionOf<D extends { readonly forbid?: infer F } ? F : never>
+  >
 >
+
+type IgnoreAny<R> = 0 extends 1 & R ? never : R
 
 type OptionsPresets<D> = D extends { readonly set?: infer F } ?
   F extends (...args: ReadonlyArray<any>) => infer O ? keyof O : never
