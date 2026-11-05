@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
-import { Effect, Layer } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { Authorizer, Condition, Permission, Principal } from "effect/permission"
+import { Model } from "effect/schema"
 import {
   admin,
   CurrentPrincipal,
@@ -12,6 +13,7 @@ import {
   Permissions,
   swap,
   Unit,
+  UnitMembership,
   units
 } from "./utils.ts"
 
@@ -21,6 +23,30 @@ const as =
   (principal: Principal.Principal<Member>) =>
   <A, E>(effect: Effect.Effect<A, E, CurrentPrincipal | Authorizer.Authorizer>): Effect.Effect<A, E> =>
     Effect.provide(Effect.provideService(effect, CurrentPrincipal, principal), TestLayer)
+
+class Shift extends Model.Class<Shift>("Shift")({
+  id: Model.UuidV4Insert(Schema.String.pipe(Schema.brand("ShiftId"))),
+  unitId: Schema.String,
+  ownerId: Model.GeneratedByApp(Schema.String),
+  createdAt: Model.DateTimeInsert
+}) {}
+
+const ShiftPermissions = Permission.make(CurrentPrincipal, {
+  rules: [
+    Permission.rules(CurrentPrincipal, Shift).create("shifts:create", {
+      set: ({ principal }) => ({ ownerId: principal.subject.id }),
+      check: ({ principal, resource: shift }) => Condition.related(UnitMembership, principal.subject.id, shift.unitId)
+    })
+  ]
+})
+
+const asShifts =
+  (principal: Principal.Principal<Member>) =>
+  <A, E>(effect: Effect.Effect<A, E, CurrentPrincipal | Authorizer.Authorizer>): Effect.Effect<A, E> =>
+    Effect.provide(
+      Effect.provideService(effect, CurrentPrincipal, principal),
+      ShiftPermissions.layer.pipe(Layer.provide(Authorizer.layerRelationsMemory(memberships)))
+    )
 
 const denial = <A>(effect: Effect.Effect<A, unknown>) =>
   Effect.flip(effect).pipe(
@@ -132,6 +158,30 @@ describe("Permission", () => {
           "PermissionDenied:NoPermission"
         )
       }))
+
+    it.effect("builds a Model's insert variant, with its generated fields, before the check", () =>
+      Effect.gen(function*() {
+        const created = yield* ShiftPermissions.create("shifts:create", { unitId: "u-2" }).pipe(asShifts(nurse))
+        assert.strictEqual(created.ownerId, "p-nurse")
+        assert.isString(created.id)
+        assert.isTrue(DateTime.isDateTime(created.createdAt))
+        assert.strictEqual(
+          yield* denial(ShiftPermissions.create("shifts:create", { unitId: "u-3" }).pipe(asShifts(nurse))),
+          "PermissionDenied:NoPermission"
+        )
+      }))
+
+    it.effect("denies guests before building the value, and takes preset fields from the system", () =>
+      Effect.gen(function*() {
+        assert.strictEqual(
+          yield* denial(ShiftPermissions.create("shifts:create", { unitId: "u-2" }).pipe(asShifts(Principal.guest))),
+          "Unauthenticated"
+        )
+        const created = yield* ShiftPermissions.create("shifts:create", { unitId: "u-9", ownerId: "rota-import" }).pipe(
+          asShifts(Principal.system("rota-import"))
+        )
+        assert.strictEqual(created.ownerId, "rota-import")
+      }))
   })
 
   describe("update", () => {
@@ -157,19 +207,20 @@ describe("Permission", () => {
   })
 
   describe("rules", () => {
-    it("rejects actions that refer to themselves through allowed", () => {
+    it("rejects actions that refer to actions not declared before them", () => {
       assert.throws(
         () =>
-          Permission.rules(CurrentPrincipal, Unit, {
-            "a": { filter: ({ allowed }) => allowed("b") },
-            "b": { filter: ({ allowed }) => allowed("a") }
-          }),
-        /refers to itself/
+          Permission.rules(CurrentPrincipal, Unit)
+            // @ts-expect-error -- "b" is not declared yet
+            .action("a", { filter: ({ allowed }) => allowed("b") }),
+        /not an action declared before it/
       )
     })
 
     it("rejects actions declared twice", () => {
-      const rules = Permission.rules(CurrentPrincipal, Unit, { "a": { filter: () => Condition.always } })
+      const rules = Permission.rules(CurrentPrincipal, Unit).action("a", { filter: () => Condition.always })
+      // @ts-expect-error -- "a" is already declared
+      assert.throws(() => rules.action("a", { filter: () => Condition.always }), /declared twice/)
       assert.throws(() => Permission.make(CurrentPrincipal, { rules: [rules, rules] }), /declared twice/)
     })
   })

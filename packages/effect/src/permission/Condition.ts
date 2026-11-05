@@ -94,12 +94,24 @@ type Leaf =
  * @since 4.1.3
  */
 export type Refs<A> = [NonNullable<A>] extends [Leaf] ? Ref<A>
-  : [NonNullable<A>] extends [object] ?
-      & Ref<A>
-      & {
-        readonly [K in keyof NonNullable<A> & string]: Refs<NonNullable<A>[K] | Extract<A, null | undefined>>
-      }
+  : [NonNullable<A>] extends [object] ? ObjectRefs<A>
   : Ref<A>
+
+/**
+ * The {@link Refs} of an object: a {@link Ref} to the object, with one
+ * reference per field.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.3
+ */
+// One mapped type rather than an intersection, so errors show the object's
+// fields instead of expanding every nested reference
+export type ObjectRefs<A> = {
+  readonly [K in (keyof NonNullable<A> & string) | typeof RefTypeId]: K extends typeof RefTypeId ?
+    Ref<A>[typeof RefTypeId]
+    : Refs<NonNullable<A>[K & keyof NonNullable<A>] | Extract<A, null | undefined>>
+}
 
 /**
  * A condition operand: either a literal value or a {@link Ref} to a field.

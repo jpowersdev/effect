@@ -139,8 +139,8 @@ export interface Request {
  *   action's `check` rule (or its `filter` when it has no `check`) and its
  *   `forbid` rule.
  * - `plan` decides which resources the principal may perform the action on,
- *   using the action's `filter`, or its `check` for actions that only create
- *   resources. An allowed plan's condition refers only to resource fields.
+ *   using the action's `filter`, or its `check` for create actions. An allowed
+ *   plan's condition refers only to resource fields.
  *
  * @stability experimental
  * @category services
@@ -332,9 +332,9 @@ export const make = <I, A, U extends Permission.Any>(
         if ("_tag" in entry) {
           return entry
         }
-        // Actions that only create resources have no filter; their check says
-        // which resources the principal could create
-        const condition = entry.filter ?? entry.check
+        // Create actions have no filter; their check says which resources the
+        // principal could create
+        const condition = entry.kind === "create" ? entry.check : entry.filter
         if (condition === undefined) {
           return deny(request.action, "NoPermission")
         }

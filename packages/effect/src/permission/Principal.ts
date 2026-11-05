@@ -8,7 +8,8 @@
  * an optional revision for cache invalidation.
  *
  * Applications provide the principal as their own `Context.Service`, so the
- * attribute type is theirs and handlers that check permissions require it.
+ * attribute type is theirs and handlers that check permissions require it. The
+ * subject id type can be the application's own too, such as a branded id.
  *
  * **Example** (Declaring the application's principal)
  *
@@ -30,6 +31,7 @@
  * @stability experimental
  * @since 4.1.3
  */
+import type * as Brand from "../Brand.ts"
 import { dual } from "../Function.ts"
 import type * as Condition from "./Condition.ts"
 
@@ -40,9 +42,9 @@ import type * as Condition from "./Condition.ts"
  * @category models
  * @since 4.1.3
  */
-export interface Subject {
+export interface Subject<out Id extends string = string> {
   readonly kind: "user" | "service"
-  readonly id: string
+  readonly id: Id
 }
 
 /**
@@ -62,9 +64,9 @@ export interface Subject {
  * @category models
  * @since 4.1.3
  */
-export interface Authenticated<out A> {
+export interface Authenticated<out A, out Id extends string = string> {
   readonly _tag: "Authenticated"
-  readonly subject: Subject
+  readonly subject: Subject<Id>
   readonly attributes: A
   readonly actor: Subject | undefined
   readonly limits: ReadonlyArray<ReadonlyArray<string>>
@@ -102,7 +104,7 @@ export interface System {
  * @category models
  * @since 4.1.3
  */
-export type Principal<A> = Authenticated<A> | Guest | System
+export type Principal<A, Id extends string = string> = Authenticated<A, Id> | Guest | System
 
 /**
  * The fields of an authenticated principal that rules can reference.
@@ -111,8 +113,8 @@ export type Principal<A> = Authenticated<A> | Guest | System
  * @category models
  * @since 4.1.3
  */
-export interface Fields<A> {
-  readonly subject: Subject
+export interface Fields<A, Id extends string = string> {
+  readonly subject: Subject<Id>
   readonly attributes: A
   readonly actor: Subject | undefined
 }
@@ -125,13 +127,18 @@ export interface Fields<A> {
  * @category models
  * @since 4.1.3
  */
-export type Refs<A> = Condition.Refs<Fields<A>>
+export type Refs<A, Id extends string = string> = Condition.Refs<Fields<A, Id>>
 
-const toSubject = (subject: Subject | string): Subject =>
+const toSubject = <Id extends string>(subject: Subject<Id> | Id): Subject<Id> =>
   typeof subject === "string" ? { kind: "user", id: subject } : subject
 
+// A literal subject widens to `string`, like `let`; a branded id keeps its brand
+type IdOf<Id extends string> = Id extends Brand.Brand<any> ? Id : string
+
 /**
- * Creates an authenticated principal. A string subject is a user id.
+ * Creates an authenticated principal. A string subject is a user id. A
+ * branded subject id, such as a `Schema.brand` id, becomes the principal's id
+ * type; any other id is a `string`.
  *
  * **Example** (Creating a principal)
  *
@@ -148,15 +155,15 @@ const toSubject = (subject: Subject | string): Subject =>
  * @category constructors
  * @since 4.1.3
  */
-export const make = <A>(options: {
-  readonly subject: Subject | string
+export const make = <A, Id extends string = string>(options: {
+  readonly subject: Subject<Id> | Id
   readonly attributes: A
   readonly actor?: Subject | string | undefined
   readonly limit?: Iterable<string> | undefined
   readonly revision?: string | undefined
-}): Authenticated<A> => ({
+}): Authenticated<A, IdOf<Id>> => ({
   _tag: "Authenticated",
-  subject: toSubject(options.subject),
+  subject: toSubject(options.subject as Subject<IdOf<Id>> | IdOf<Id>),
   attributes: options.attributes,
   actor: options.actor === undefined ? undefined : toSubject(options.actor),
   limits: options.limit === undefined ? [] : [Array.from(options.limit)],
@@ -189,7 +196,8 @@ export const system = (name: string): System => ({ _tag: "System", name })
  * @category guards
  * @since 4.1.3
  */
-export const isAuthenticated = <A>(self: Principal<A>): self is Authenticated<A> => self._tag === "Authenticated"
+export const isAuthenticated = <A, Id extends string>(self: Principal<A, Id>): self is Authenticated<A, Id> =>
+  self._tag === "Authenticated"
 
 /**
  * Returns `true` when a principal is a guest.
@@ -198,7 +206,7 @@ export const isAuthenticated = <A>(self: Principal<A>): self is Authenticated<A>
  * @category guards
  * @since 4.1.3
  */
-export const isGuest = <A>(self: Principal<A>): self is Guest => self._tag === "Guest"
+export const isGuest = <A, Id extends string>(self: Principal<A, Id>): self is Guest => self._tag === "Guest"
 
 /**
  * Returns `true` when a principal is the system.
@@ -207,7 +215,7 @@ export const isGuest = <A>(self: Principal<A>): self is Guest => self._tag === "
  * @category guards
  * @since 4.1.3
  */
-export const isSystem = <A>(self: Principal<A>): self is System => self._tag === "System"
+export const isSystem = <A, Id extends string>(self: Principal<A, Id>): self is System => self._tag === "System"
 
 /**
  * Adds a limit to an authenticated principal. Limits only narrow: the request
@@ -218,9 +226,9 @@ export const isSystem = <A>(self: Principal<A>): self is System => self._tag ===
  * @since 4.1.3
  */
 export const withLimit: {
-  (limit: Iterable<string>): <A>(self: Authenticated<A>) => Authenticated<A>
-  <A>(self: Authenticated<A>, limit: Iterable<string>): Authenticated<A>
-} = dual(2, <A>(self: Authenticated<A>, limit: Iterable<string>): Authenticated<A> => ({
+  (limit: Iterable<string>): <A, Id extends string>(self: Authenticated<A, Id>) => Authenticated<A, Id>
+  <A, Id extends string>(self: Authenticated<A, Id>, limit: Iterable<string>): Authenticated<A, Id>
+} = dual(2, <A, Id extends string>(self: Authenticated<A, Id>, limit: Iterable<string>): Authenticated<A, Id> => ({
   ...self,
   limits: [...self.limits, Array.from(limit)]
 }))
@@ -233,9 +241,9 @@ export const withLimit: {
  * @since 4.1.3
  */
 export const withActor: {
-  (actor: Subject | string): <A>(self: Authenticated<A>) => Authenticated<A>
-  <A>(self: Authenticated<A>, actor: Subject | string): Authenticated<A>
-} = dual(2, <A>(self: Authenticated<A>, actor: Subject | string): Authenticated<A> => ({
+  (actor: Subject | string): <A, Id extends string>(self: Authenticated<A, Id>) => Authenticated<A, Id>
+  <A, Id extends string>(self: Authenticated<A, Id>, actor: Subject | string): Authenticated<A, Id>
+} = dual(2, <A, Id extends string>(self: Authenticated<A, Id>, actor: Subject | string): Authenticated<A, Id> => ({
   ...self,
   actor: toSubject(actor)
 }))
