@@ -1,4 +1,4 @@
-import { Clock, Context, Effect, Schema } from "effect"
+import { Clock, Context, Effect, type Layer, Schema } from "effect"
 import { type Authorizer, Condition, Permission, type PermissionError, Principal } from "effect/permission"
 import { Model } from "effect/schema"
 import { describe, expect, it } from "tstyche"
@@ -119,6 +119,7 @@ describe("rules", () => {
     const BrokenPermissions = Permission.make(CurrentPrincipal, { rules: [Broken] })
     expect(BrokenPermissions.create).type.toBeCallableWith("posts:create", payload)
     expect(BrokenPermissions.require).type.toBeCallableWith("posts:read", post)
+    expect(BrokenPermissions.layer).type.toBe<Layer.Layer<Authorizer.Authorizer>>()
   })
 
   it("collects the services custom conditions require", () => {
