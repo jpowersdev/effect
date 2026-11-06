@@ -206,6 +206,24 @@ describe("Condition", () => {
         assert.strictEqual(loads.count, 1)
       }))
 
+    it.effect("loads lazy attributes as a whole the first time any is read", () =>
+      Effect.gen(function*() {
+        const loads = { count: 0 }
+        const principal = Principal.make({
+          subject: "u1",
+          attributes: Principal.lazy(Effect.sync(() => {
+            loads.count++
+            return { admin: false, unitIds: ["d1"] }
+          }))
+        })
+        const { principal: refs, resource } = Condition.refs<typeof principal, Doc>()
+        const condition = Condition.or(refs.attributes.admin, Condition.oneOf(resource.id, refs.attributes.unitIds))
+        assert.isTrue(yield* Condition.evaluate(condition, { principal, resource: doc }))
+        assert.strictEqual((yield* Condition.simplify(condition, principal))._tag, "OneOf")
+        assert.deepStrictEqual((yield* principal.attributes).unitIds, ["d1"])
+        assert.strictEqual(loads.count, 1)
+      }))
+
     it.effect("loads a lazy attribute at any depth", () =>
       Effect.gen(function*() {
         const principal = Principal.make({
