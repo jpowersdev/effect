@@ -6,8 +6,8 @@
  * resource type and builds the application's typed `Permissions` object.
  * `Authorizer` is the service that makes decisions, in process or through a
  * remote engine. `PermissionError` holds the errors checks fail with.
- * `PermissionHttpApi`, `PermissionRpc`, and `PermissionSql` enforce rules at
- * HttpApi endpoints, at RPCs, and in SQL queries.
+ * `PermissionMiddleware` enforces rules at HttpApi endpoints and RPCs, and
+ * `PermissionSql` in SQL queries.
  *
  * @stability experimental
  * @since 4.1.3
@@ -43,13 +43,7 @@ export * as PermissionError from "./PermissionError.ts"
  * @stability experimental
  * @since 4.1.3
  */
-export * as PermissionHttpApi from "./PermissionHttpApi.ts"
-
-/**
- * @stability experimental
- * @since 4.1.3
- */
-export * as PermissionRpc from "./PermissionRpc.ts"
+export * as PermissionMiddleware from "./PermissionMiddleware.ts"
 
 /**
  * @stability experimental
