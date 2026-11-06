@@ -108,6 +108,29 @@ describe("lazy attributes", () => {
       // @ts-expect-error Property '"is an effect, so wrap it with Principal.lazy"' is missing
       attributes: { teamIds: Effect.succeed([]) }
     })
+    Principal.make({
+      subject: "p-1",
+      // @ts-expect-error Property '"is an effect, so wrap it with Principal.lazy"' is missing
+      attributes: Effect.succeed({ editor: true })
+    })
+  })
+
+  it("can be the whole attributes object", () => {
+    const principal = Principal.make({
+      subject: ProfileId.make("p-1"),
+      attributes: Principal.lazy(
+        Effect.all({ editor: Effect.succeed(true), teamIds: Effect.succeed<ReadonlyArray<string>>([]) })
+      )
+    })
+    expect(principal).type.toBeAssignableTo<Principal.Principal<Principal.Lazy<Member>, ProfileId>>()
+    class WholeLazyPrincipal extends Context.Service<
+      WholeLazyPrincipal,
+      Principal.Principal<Principal.Lazy<Member>, ProfileId>
+    >()("test/WholeLazyPrincipal") {}
+    // Rules refer to its fields as usual
+    Permission.rules(WholeLazyPrincipal, Note).action("notes:edit", {
+      filter: ({ principal }) => principal.attributes.editor
+    })
   })
 
   it("are referred to in rules as the value they load", () => {

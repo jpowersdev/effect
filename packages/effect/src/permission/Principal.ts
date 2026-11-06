@@ -196,13 +196,15 @@ export interface NotLazy<Key extends PropertyKey> {
   readonly "is an effect, so wrap it with Principal.lazy": Key
 }
 
-// Rejects a top-level attribute that is an effect but not lazy, which
-// conditions would read as a plain value
-type LazyOnly<A> = {
-  readonly [K in keyof A]: A[K] extends { readonly [LazyTypeId]: unknown } ? unknown
-    : A[K] extends Effect.Effect<any, any, any> ? NotLazy<K>
-    : unknown
-}
+// Rejects attributes, or a top-level attribute, that are an effect but not
+// lazy, which conditions would read as a plain value
+type LazyOnly<A> = A extends { readonly [LazyTypeId]: unknown } ? unknown
+  : A extends Effect.Effect<any, any, any> ? NotLazy<"attributes">
+  : {
+    readonly [K in keyof A]: A[K] extends { readonly [LazyTypeId]: unknown } ? unknown
+      : A[K] extends Effect.Effect<any, any, any> ? NotLazy<K>
+      : unknown
+  }
 
 class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavailable> {
   readonly [LazyTypeId] = { _A: identity }
@@ -231,8 +233,10 @@ class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavaila
  * **Details**
  *
  * A lazy attribute can be at any depth of the attributes, such as
- * `org: { plan: Principal.lazy(loadPlan(orgId)) }`. `load` can't require
- * services, so close over them where the principal is built.
+ * `org: { plan: Principal.lazy(loadPlan(orgId)) }`. It can also be the whole
+ * attributes object, loaded the first time a rule or handler reads any of it:
+ * `Principal.lazy(Effect.all({ ... }))`. `load` can't require services, so
+ * close over them where the principal is built.
  *
  * **Example** (Loading an attribute only when a rule needs it)
  *
