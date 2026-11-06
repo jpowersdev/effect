@@ -1,7 +1,15 @@
 import { assert, describe, it } from "@effect/vitest"
 import { Effect, Exit, FileSystem, Layer, Path, Schema } from "effect"
 import { Etag, HttpPlatform, HttpRouter } from "effect/http"
-import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiTest } from "effect/http-api"
+import {
+  HttpApi,
+  HttpApiBuilder,
+  HttpApiEndpoint,
+  HttpApiGroup,
+  HttpApiMiddleware,
+  HttpApiTest,
+  OpenApi
+} from "effect/http-api"
 import { Authorizer, Permission, PermissionError, PermissionHttpApi, Principal } from "effect/permission"
 import { CurrentPrincipal, manager, type Member, memberships, nurse, Permissions, Unit, units } from "./utils.ts"
 
@@ -70,6 +78,13 @@ const client = (principal: Principal.Principal<Member>) =>
   )
 
 describe("PermissionHttpApi", () => {
+  it("names the permission errors plainly in OpenAPI documents", () => {
+    const names = Object.keys(OpenApi.fromApi(Api).components.schemas)
+    for (const name of ["UnauthenticatedEncoded", "PermissionDeniedEncoded", "PermissionUnavailableEncoded"]) {
+      assert.include(names, name)
+    }
+  })
+
   it.effect("lets allowed requests through and filters in the handler", () =>
     Effect.gen(function*() {
       const api = yield* client(nurse)

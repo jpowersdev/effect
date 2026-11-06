@@ -45,10 +45,12 @@ export type DenyReason = typeof DenyReason.Type
  * @category errors
  * @since 4.1.3
  */
+// Each error's `identifier` names it in OpenAPI documents, which would
+// otherwise show `effect_permission_UnauthenticatedEncoded`
 export class Unauthenticated extends Schema.TaggedError<Unauthenticated>("effect/permission/Unauthenticated")(
   "Unauthenticated",
   { action: Schema.String },
-  { httpApiStatus: 401 }
+  { httpApiStatus: 401, identifier: "Unauthenticated" }
 ) {}
 
 /**
@@ -65,7 +67,7 @@ export class PermissionDenied extends Schema.TaggedError<PermissionDenied>("effe
     action: Schema.String,
     reason: DenyReason
   },
-  { httpApiStatus: 403 }
+  { httpApiStatus: 403, identifier: "PermissionDenied" }
 ) {}
 
 /**
@@ -81,7 +83,7 @@ export class PermissionUnavailable
   extends Schema.TaggedError<PermissionUnavailable>("effect/permission/PermissionUnavailable")(
     "PermissionUnavailable",
     {},
-    { httpApiStatus: 503 }
+    { httpApiStatus: 503, identifier: "PermissionUnavailable" }
   )
 {}
 
