@@ -143,48 +143,52 @@ describe("Condition", () => {
   })
 
   describe("lazy attributes", () => {
-    interface LazyCaller {
-      readonly admin: boolean
-      readonly unitIds: Principal.Lazy<ReadonlyArray<string>>
-    }
-    const lazy = Condition.refs<LazyCaller, Doc>()
-    const condition = Condition.or(lazy.principal.admin, Condition.oneOf(lazy.resource.id, lazy.principal.unitIds))
-
-    const counted = <A, E>(load: Effect.Effect<A, E>) => {
+    // Counts the loads of an attribute given to `Principal.make` as an effect
+    const signIn = <E>(admin: boolean, unitIds: Effect.Effect<ReadonlyArray<string>, E>) => {
       const loads = { count: 0 }
-      const attribute = Principal.lazy(Effect.suspend(() => {
-        loads.count++
-        return load
-      }))
-      return { attribute, loads }
+      const principal = Principal.make({
+        subject: "u1",
+        attributes: {
+          admin,
+          unitIds: Effect.suspend(() => {
+            loads.count++
+            return unitIds
+          })
+        }
+      })
+      return { principal, loads }
     }
+    const lazy = Condition.refs<ReturnType<typeof signIn>["principal"], Doc>()
+    const condition = Condition.or(
+      lazy.principal.attributes.admin,
+      Condition.oneOf(lazy.resource.id, lazy.principal.attributes.unitIds)
+    )
 
     it.effect("loads an attribute only when a condition reaches it, and only once", () =>
       Effect.gen(function*() {
-        const { attribute: unitIds, loads } = counted(Effect.succeed(["d1"]))
-        assert.isTrue(yield* Condition.evaluate(condition, { principal: { admin: true, unitIds }, resource: doc }))
-        assert.isTrue(Condition.isAlways(yield* Condition.simplify(condition, { admin: true, unitIds })))
-        assert.strictEqual(loads.count, 0)
+        const admin = signIn(true, Effect.succeed(["d1"]))
+        assert.isTrue(yield* Condition.evaluate(condition, { principal: admin.principal, resource: doc }))
+        assert.isTrue(Condition.isAlways(yield* Condition.simplify(condition, admin.principal)))
+        assert.strictEqual(admin.loads.count, 0)
 
-        assert.isTrue(yield* Condition.evaluate(condition, { principal: { admin: false, unitIds }, resource: doc }))
-        const simplified = yield* Condition.simplify(condition, { admin: false, unitIds })
+        const member = signIn(false, Effect.succeed(["d1"]))
+        assert.isTrue(yield* Condition.evaluate(condition, { principal: member.principal, resource: doc }))
+        const simplified = yield* Condition.simplify(condition, member.principal)
         assert.strictEqual(simplified._tag, "OneOf")
-        assert.deepStrictEqual(yield* unitIds, ["d1"])
-        assert.strictEqual(loads.count, 1)
+        assert.deepStrictEqual(yield* member.principal.attributes.unitIds, ["d1"])
+        assert.strictEqual(member.loads.count, 1)
       }))
 
     it.effect("shares one load between readers at the same time", () =>
       Effect.gen(function*() {
         const gate = yield* Deferred.make<void>()
-        const { attribute: unitIds, loads } = counted(Effect.as(Deferred.await(gate), ["d1"]))
+        const { loads, principal } = signIn(false, Effect.as(Deferred.await(gate), ["d1"]))
         const readers = yield* Effect.forkChild(
           Effect.all([
-            unitIds,
-            unitIds,
-            Condition.evaluate(condition, { principal: { admin: false, unitIds }, resource: doc })
-          ], {
-            concurrency: "unbounded"
-          })
+            principal.attributes.unitIds,
+            principal.attributes.unitIds,
+            Condition.evaluate(condition, { principal, resource: doc })
+          ], { concurrency: "unbounded" })
         )
         yield* Effect.yieldNow
         yield* Deferred.succeed(gate, undefined)
@@ -194,13 +198,25 @@ describe("Condition", () => {
 
     it.effect("fails with PermissionUnavailable when an attribute can't load, and keeps the failure", () =>
       Effect.gen(function*() {
-        const { attribute: unitIds, loads } = counted(Effect.fail("down"))
-        const principal = { admin: false, unitIds }
+        const { loads, principal } = signIn(false, Effect.fail("down"))
         const error = yield* Effect.flip(Condition.evaluate(condition, { principal, resource: doc }))
         assert.strictEqual(error._tag, "PermissionUnavailable")
         assert.strictEqual((yield* Effect.flip(Condition.simplify(condition, principal)))._tag, "PermissionUnavailable")
-        assert.strictEqual((yield* Effect.flip(unitIds))._tag, "PermissionUnavailable")
+        assert.strictEqual((yield* Effect.flip(principal.attributes.unitIds))._tag, "PermissionUnavailable")
         assert.strictEqual(loads.count, 1)
       }))
+
+    it("keeps attributes without effects as they are", () => {
+      class Member {
+        constructor(readonly admin: boolean) {}
+      }
+      const attributes = new Member(true)
+      assert.strictEqual(Principal.make({ subject: "u1", attributes }).attributes, attributes)
+      const mixed = Principal.make({
+        subject: "u1",
+        attributes: Object.assign(new Member(true), { load: Effect.void })
+      })
+      assert.instanceOf(mixed.attributes, Member)
+    })
   })
 })
