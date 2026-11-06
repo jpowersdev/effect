@@ -82,11 +82,27 @@ describe("Principal", () => {
 })
 
 describe("lazy attributes", () => {
-  it("are effects of the value they load", () => {
-    expect(Principal.lazy(Effect.succeed(1))).type.toBe<Principal.Lazy<number>>()
+  it("are the attributes given as effects", () => {
+    const principal = Principal.make({
+      subject: ProfileId.make("p-1"),
+      attributes: { editor: true, teamIds: Effect.fail("down").pipe(Effect.as<ReadonlyArray<string>>([])) }
+    })
+    expect(principal.attributes).type.toBe<{ editor: boolean; teamIds: Principal.Lazy<ReadonlyArray<string>> }>()
     expect(Effect.gen(function*() {
-      return yield* Principal.lazy(Effect.fail("down").pipe(Effect.as(1)))
-    })).type.toBe<Effect.Effect<number, PermissionError.PermissionUnavailable>>()
+      return yield* principal.attributes.teamIds
+    })).type.toBe<Effect.Effect<ReadonlyArray<string>, PermissionError.PermissionUnavailable>>()
+    expect(principal).type.toBeAssignableTo<Principal.Principal<LazyMember, ProfileId>>()
+    // Without effects, the attributes keep their type
+    expect(Principal.make({ subject: "p-1", attributes: post }).attributes).type.toBe<Post>()
+  })
+
+  it("can't require services", () => {
+    Principal.make({
+      subject: ProfileId.make("p-1"),
+      // @ts-expect-error Type 'CurrentPrincipal' is not assignable to type 'never'
+      // @effect-diagnostics-next-line missingEffectContext:off
+      attributes: { editor: true, teamIds: Effect.as(CurrentPrincipal, []) }
+    })
   })
 
   it("are referred to in rules as the value they load", () => {

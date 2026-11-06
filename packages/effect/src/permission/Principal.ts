@@ -11,8 +11,9 @@
  * attribute type is theirs and handlers that check permissions require it. The
  * subject id type can be the application's own too, such as a branded id.
  *
- * An attribute that costs a lookup can be {@link lazy}: it is loaded the first
- * time a rule or handler reads it, then kept for the life of the principal.
+ * An attribute that costs a lookup can be given as an effect: it is loaded
+ * the first time a rule or handler reads it, then kept for the life of the
+ * principal. See {@link Lazy}.
  *
  * **Example** (Declaring the application's principal)
  *
@@ -140,8 +141,8 @@ export interface Fields<A, Id extends string = string> {
 export type Refs<A, Id extends string = string> = Condition.Refs<Fields<A, Id>>
 
 /**
- * An attribute that is loaded the first time something reads it, then kept for
- * the life of the principal.
+ * An attribute given to {@link make} as an effect. It is loaded the first time
+ * something reads it, then kept for the life of the principal.
  *
  * **Details**
  *
@@ -183,6 +184,28 @@ export interface Lazy<out A> extends Effect.Effect<A, PermissionError.Permission
 // would compare every member of `Effect`
 export type Loaded<A> = A extends { readonly [LazyTypeId]: { readonly _A: Types.Covariant<infer B> } } ? B : A
 
+/**
+ * The attributes of a principal built by {@link make}: each top-level field
+ * given as an effect becomes {@link Lazy}.
+ *
+ * @stability experimental
+ * @category utility types
+ * @since 4.1.3
+ */
+export type Attributes<A> = [LazyKeys<A>] extends [never] ? A
+  : { [K in keyof A]: A[K] extends Effect.Effect<infer B, any, never> ? Lazy<B> : A[K] }
+
+// Rejects an attribute effect that requires services, at the attribute
+type WithoutServices<A> = {
+  readonly [K in keyof A]: A[K] extends Effect.Effect<infer B, infer E, infer R> ?
+    [R] extends [never] ? unknown : Effect.Effect<B, E, never>
+    : unknown
+}
+
+type LazyKeys<A> = {
+  [K in keyof A]-?: A[K] extends Effect.Effect<any, any, never> ? K : never
+}[keyof A]
+
 class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavailable> {
   readonly [LazyTypeId] = { _A: identity }
   readonly load: Effect.Effect<A, PermissionError.PermissionUnavailable>
@@ -203,9 +226,64 @@ class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavaila
   }
 }
 
+/** @internal */
+export const isLazy = (u: unknown): u is Lazy<unknown> => Predicate.hasProperty(u, LazyTypeId)
+
+// Replaces each top-level effect with one that loads once. The attributes are
+// copied, keeping their prototype, only if there is one to replace.
+const cacheEffects = <A>(attributes: A): Attributes<A> => {
+  if (!Predicate.isObject(attributes)) return attributes as Attributes<A>
+  let out: Record<string, unknown> | undefined
+  for (const key of Object.keys(attributes)) {
+    const value = attributes[key]
+    if (!Effect.isEffect(value) || isLazy(value)) continue
+    out ??= Object.assign(Object.create(Object.getPrototypeOf(attributes)), attributes) as Record<string, unknown>
+    // `make` only accepts effects without requirements
+    const load = value as Effect.Effect<unknown, unknown>
+    out[key] = new LazyImpl(load.pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning(`Principal attribute "${key}" failed to load`, cause).pipe(
+          Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
+        )
+      )
+    ))
+  }
+  return (out ?? attributes) as Attributes<A>
+}
+
+const toSubject = <Id extends string>(subject: Subject<Id> | Id): Subject<Id> =>
+  typeof subject === "string" ? { kind: "user", id: subject } : subject
+
+// A literal subject widens to `string`, like `let`; a branded id keeps its brand
+type IdOf<Id extends string> = Id extends Brand.Brand<any> ? Id : string
+
 /**
- * Creates an attribute that runs `load` the first time something reads it,
- * then keeps the result.
+ * Creates an authenticated principal. A string subject is a user id. A
+ * branded subject id, such as a `Schema.brand` id, becomes the principal's id
+ * type; any other id is a `string`.
+ *
+ * **Details**
+ *
+ * A top-level attribute given as an effect becomes {@link Lazy}: it runs the
+ * first time a rule or handler reads it, and its result is kept. The effect
+ * can't require services, so close over them where the principal is built.
+ *
+ * **Gotchas**
+ *
+ * - Only top-level attributes are checked for effects. To load nested data
+ *   lazily, load the whole object: `org: loadOrg(id)`.
+ * - Every effect counts, including `Exit` values and errors.
+ *
+ * **Example** (Creating a principal)
+ *
+ * ```ts
+ * import { Principal } from "effect/permission"
+ *
+ * const principal = Principal.make({
+ *   subject: "profile_1",
+ *   attributes: { orgId: "org_1", role: "member" as const }
+ * })
+ * ```
  *
  * **Example** (Loading an attribute only when a rule needs it)
  *
@@ -219,7 +297,7 @@ class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavaila
  *   subject: "profile_1",
  *   attributes: {
  *     isSuperAdmin: false,
- *     managedUnitIds: Principal.lazy(managedUnitIds("profile_1"))
+ *     managedUnitIds: managedUnitIds("profile_1")
  *   }
  * })
  *
@@ -233,60 +311,16 @@ class LazyImpl<A> extends Effectable.Class<A, PermissionError.PermissionUnavaila
  * @category constructors
  * @since 4.1.3
  */
-export const lazy = <A, E>(load: Effect.Effect<A, E>): Lazy<A> =>
-  new LazyImpl(load.pipe(
-    Effect.catch((cause) =>
-      Effect.logWarning("A lazy principal attribute failed to load", cause).pipe(
-        Effect.andThen(Effect.fail(new PermissionError.PermissionUnavailable()))
-      )
-    )
-  ))
-
-/**
- * Returns `true` when a value is a {@link Lazy} attribute.
- *
- * @stability experimental
- * @category guards
- * @since 4.1.3
- */
-export const isLazy = (u: unknown): u is Lazy<unknown> => Predicate.hasProperty(u, LazyTypeId)
-
-const toSubject = <Id extends string>(subject: Subject<Id> | Id): Subject<Id> =>
-  typeof subject === "string" ? { kind: "user", id: subject } : subject
-
-// A literal subject widens to `string`, like `let`; a branded id keeps its brand
-type IdOf<Id extends string> = Id extends Brand.Brand<any> ? Id : string
-
-/**
- * Creates an authenticated principal. A string subject is a user id. A
- * branded subject id, such as a `Schema.brand` id, becomes the principal's id
- * type; any other id is a `string`.
- *
- * **Example** (Creating a principal)
- *
- * ```ts
- * import { Principal } from "effect/permission"
- *
- * const principal = Principal.make({
- *   subject: "profile_1",
- *   attributes: { orgId: "org_1", role: "member" as const }
- * })
- * ```
- *
- * @stability experimental
- * @category constructors
- * @since 4.1.3
- */
 export const make = <A, Id extends string = string>(options: {
   readonly subject: Subject<Id> | Id
-  readonly attributes: A
+  readonly attributes: A & WithoutServices<A>
   readonly actor?: Subject | string | undefined
   readonly limit?: Iterable<string> | undefined
   readonly revision?: string | undefined
-}): Authenticated<A, IdOf<Id>> => ({
+}): Authenticated<Attributes<A>, IdOf<Id>> => ({
   _tag: "Authenticated",
   subject: toSubject(options.subject as Subject<IdOf<Id>> | IdOf<Id>),
-  attributes: options.attributes,
+  attributes: cacheEffects(options.attributes),
   actor: options.actor === undefined ? undefined : toSubject(options.actor),
   limits: options.limit === undefined ? [] : [Array.from(options.limit)],
   revision: options.revision
