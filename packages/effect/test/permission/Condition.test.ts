@@ -143,17 +143,17 @@ describe("Condition", () => {
   })
 
   describe("lazy attributes", () => {
-    // Counts the loads of an attribute given to `Principal.make` as an effect
+    // Counts the loads of a lazy attribute
     const signIn = <E>(admin: boolean, unitIds: Effect.Effect<ReadonlyArray<string>, E>) => {
       const loads = { count: 0 }
       const principal = Principal.make({
         subject: "u1",
         attributes: {
           admin,
-          unitIds: Effect.suspend(() => {
+          unitIds: Principal.lazy(Effect.suspend(() => {
             loads.count++
             return unitIds
-          })
+          }))
         }
       })
       return { principal, loads }
@@ -206,17 +206,16 @@ describe("Condition", () => {
         assert.strictEqual(loads.count, 1)
       }))
 
-    it("keeps attributes without effects as they are", () => {
-      class Member {
-        constructor(readonly admin: boolean) {}
-      }
-      const attributes = new Member(true)
-      assert.strictEqual(Principal.make({ subject: "u1", attributes }).attributes, attributes)
-      const mixed = Principal.make({
-        subject: "u1",
-        attributes: Object.assign(new Member(true), { load: Effect.void })
-      })
-      assert.instanceOf(mixed.attributes, Member)
-    })
+    it.effect("loads a lazy attribute at any depth", () =>
+      Effect.gen(function*() {
+        const principal = Principal.make({
+          subject: "u1",
+          attributes: { org: { id: "o1", plan: Principal.lazy(Effect.succeed("pro")) } }
+        })
+        const { principal: refs } = Condition.refs<typeof principal, Doc>()
+        const condition = Condition.eq(refs.attributes.org.plan, "pro")
+        assert.isTrue(yield* Condition.evaluate(condition, { principal, resource: doc }))
+        assert.isTrue(Condition.isAlways(yield* Condition.simplify(condition, principal)))
+      }))
   })
 })

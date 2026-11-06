@@ -82,26 +82,31 @@ describe("Principal", () => {
 })
 
 describe("lazy attributes", () => {
-  it("are the attributes given as effects", () => {
-    const principal = Principal.make({
-      subject: ProfileId.make("p-1"),
-      attributes: { editor: true, teamIds: Effect.fail("down").pipe(Effect.as<ReadonlyArray<string>>([])) }
-    })
-    expect(principal.attributes).type.toBe<{ editor: boolean; teamIds: Principal.Lazy<ReadonlyArray<string>> }>()
+  it("are effects of the value they load", () => {
+    expect(Principal.lazy(Effect.succeed(1))).type.toBe<Principal.Lazy<number>>()
     expect(Effect.gen(function*() {
-      return yield* principal.attributes.teamIds
-    })).type.toBe<Effect.Effect<ReadonlyArray<string>, PermissionError.PermissionUnavailable>>()
-    expect(principal).type.toBeAssignableTo<Principal.Principal<LazyMember, ProfileId>>()
-    // Without effects, the attributes keep their type
-    expect(Principal.make({ subject: "p-1", attributes: post }).attributes).type.toBe<Post>()
+      return yield* Principal.lazy(Effect.fail("down").pipe(Effect.as(1)))
+    })).type.toBe<Effect.Effect<number, PermissionError.PermissionUnavailable>>()
+    expect(
+      Principal.make({
+        subject: ProfileId.make("p-1"),
+        attributes: { editor: true, teamIds: Principal.lazy(Effect.succeed([])) }
+      })
+    )
+      .type.toBeAssignableTo<Principal.Principal<LazyMember, ProfileId>>()
   })
 
   it("can't require services", () => {
+    // @ts-expect-error Type 'CurrentPrincipal' is not assignable to type 'never'
+    // @effect-diagnostics-next-line missingEffectContext:off
+    Principal.lazy(Effect.as(CurrentPrincipal, []))
+  })
+
+  it("must be wrapped, so an effect is never read as a value", () => {
     Principal.make({
-      subject: ProfileId.make("p-1"),
-      // @ts-expect-error Type 'CurrentPrincipal' is not assignable to type 'never'
-      // @effect-diagnostics-next-line missingEffectContext:off
-      attributes: { editor: true, teamIds: Effect.as(CurrentPrincipal, []) }
+      subject: "p-1",
+      // @ts-expect-error Property '"is an effect, so wrap it with Principal.lazy"' is missing
+      attributes: { teamIds: Effect.succeed([]) }
     })
   })
 

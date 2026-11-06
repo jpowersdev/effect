@@ -276,10 +276,10 @@ describe("Permission", () => {
         subject: "p-1",
         attributes: {
           isSuperAdmin,
-          homeHospitalId: Effect.suspend(() => {
+          homeHospitalId: Principal.lazy(Effect.suspend(() => {
             loads.count++
             return homeHospitalId
-          })
+          }))
         }
       })
       const run = <A, E2>(effect: Effect.Effect<A, E2, LazyPrincipal | Authorizer.Authorizer>) =>
