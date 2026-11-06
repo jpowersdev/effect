@@ -1,9 +1,10 @@
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Deferred, Effect, Fiber, Layer, Schema } from "effect"
 import { Authorizer, Condition, Permission, PermissionSql, Principal } from "effect/permission"
 import { Reactivity } from "effect/reactivity"
 import * as SqlClient from "effect/sql/SqlClient"
+import * as Statement from "effect/sql/Statement"
 
 class Unit extends Schema.Class<Unit>("Unit")({
   id: Schema.String,
@@ -86,6 +87,26 @@ const visibleUnitIds = Effect.gen(function*() {
   return rows.map((row) => row.id)
 })
 
+// Runs an effect, recording the relation lookups it sends to the database
+const lookups = Effect.fnUntraced(function*<A, E, R>(effect: Effect.Effect<A, E, R>) {
+  const statements: Array<string> = []
+  const result = yield* effect.pipe(
+    Effect.provideService(Statement.CurrentTransformer, (self) =>
+      Effect.sync(() => {
+        const [text] = self.compile()
+        if (text.includes("profile_unit")) statements.push(text)
+        return self
+      }))
+  )
+  return [result, statements.length] as const
+})
+
+const canRead = (principal: Principal.Principal<Member>, unit: Unit) =>
+  Permissions.can("units:read", unit).pipe(
+    Effect.map(Authorizer.isAllow),
+    Effect.provideService(CurrentPrincipal, principal)
+  )
+
 describe("Permission with SQLite", () => {
   it.effect("returns only the rows the principal may see", () =>
     Effect.gen(function*() {
@@ -115,5 +136,35 @@ describe("Permission with SQLite", () => {
           )
         }
       }
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("batches the relation lookups of checks that run at the same time", () =>
+    Effect.gen(function*() {
+      // Each unit needs a relation lookup, since the float nurse's home hospital matches none
+      const float = principals[1]
+      const check = (unit: Unit) => canRead(float, unit)
+      assert.deepStrictEqual(yield* lookups(Effect.forEach(units, check, { concurrency: "unbounded" })), [
+        [false, false, true],
+        1
+      ])
+      assert.deepStrictEqual(yield* lookups(Effect.forEach(units, check)), [[false, false, true], 3])
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("keeps a lookup inside a transaction apart from one outside it", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const [nurse] = principals
+      const oncology = units[2]
+      const gate = yield* Deferred.make<void>()
+      // Waits for the transaction's write, so both lookups are pending at once
+      const outside = yield* Effect.forkChild(Deferred.await(gate).pipe(Effect.andThen(canRead(nurse, oncology))))
+      const inside = yield* sql.withTransaction(Effect.gen(function*() {
+        yield* sql`INSERT INTO profile_unit ${sql.insert({ profile_id: "p-nurse", unit_id: "u-3" })}`
+        yield* Deferred.succeed(gate, undefined)
+        // Rolls the write back
+        return yield* Effect.fail(yield* canRead(nurse, oncology))
+      })).pipe(Effect.flip)
+      assert.isTrue(inside)
+      assert.isFalse(yield* Fiber.join(outside))
     }).pipe(Effect.provide(TestLayer)))
 })
